@@ -1,0 +1,27 @@
+# Virtual Environment
+venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Environment Variables
+.env
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+# Tunnel tools
+cloudflared.exe
+ngrok.exe
+
+# Images
+*.jpg
+*.jpeg
+*.png
