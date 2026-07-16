@@ -1,0 +1,92 @@
+{
+  "version": "7.1",
+  "data_api_version": "3.0",
+  "routing_model": {
+    "DOCTOR_PICKER": []
+  },
+  "screens": [
+    {
+      "id": "DOCTOR_PICKER",
+      "title": "اختر الطبيب",
+      "terminal": true,
+      "success": true,
+      "data": {
+        "heading": {
+          "type": "string",
+          "__example__": "الأطباء المتاحون"
+        },
+        "images": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "src": { "type": "string" },
+              "alt-text": { "type": "string" }
+            }
+          },
+          "__example__": [
+            {
+              "src": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+              "alt-text": "Doctor 1"
+            },
+            {
+              "src": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+              "alt-text": "Doctor 2"
+            }
+          ]
+        },
+        "doctors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "title": { "type": "string" },
+              "description": { "type": "string" }
+            }
+          },
+          "__example__": [
+            { "id": "1", "title": "د. أحمد", "description": "قلب" },
+            { "id": "2", "title": "د. سارة", "description": "قلب" }
+          ]
+        }
+      },
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "TextHeading",
+            "text": "${data.heading}"
+          },
+          {
+            "type": "TextBody",
+            "text": "مرّر بين الصور يمين ويسار، ثم اختر الطبيب من القائمة."
+          },
+          {
+            "type": "ImageCarousel",
+            "images": "${data.images}",
+            "aspect-ratio": "4:3",
+            "scale-type": "cover"
+          },
+          {
+            "type": "RadioButtonsGroup",
+            "name": "doctor_id",
+            "label": "اختر الطبيب",
+            "required": true,
+            "data-source": "${data.doctors}"
+          },
+          {
+            "type": "Footer",
+            "label": "متابعة",
+            "on-click-action": {
+              "name": "complete",
+              "payload": {
+                "doctor_id": "${form.doctor_id}"
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
