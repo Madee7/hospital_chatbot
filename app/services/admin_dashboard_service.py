@@ -167,6 +167,7 @@ def list_doctors(db: Session, clinic_id: int) -> list[dict]:
             "title": d.title,
             "specialization": d.specialization,
             "bio": d.bio,
+            "bio_en": getattr(d, "bio_en", None),
             "photo_url": d.photo_url,
             "active_flag": d.active_flag,
         }
@@ -184,6 +185,7 @@ def upsert_doctor(
     title: str | None,
     specialization: str | None,
     bio: str | None,
+    bio_en: str | None = None,
     photo_url: str | None,
     department_id: int | None,
     active_flag: bool = True,
@@ -225,6 +227,7 @@ def upsert_doctor(
     synced_spec = (specialization or "").strip() or (dept.name_en or dept.name_ar)
     doctor.specialization = synced_spec
     doctor.bio = bio
+    doctor.bio_en = bio_en
     doctor.photo_url = photo_url
     doctor.department_id = department_id
     doctor.active_flag = active_flag
@@ -395,6 +398,7 @@ def resequence_doctor_ids(db: Session) -> dict[int, int]:
             title=src.title,
             specialization=src.specialization,
             bio=src.bio,
+            bio_en=getattr(src, "bio_en", None),
             photo_url=src.photo_url,
             active_flag=src.active_flag,
             created_by=src.created_by,
@@ -421,6 +425,7 @@ def resequence_doctor_ids(db: Session) -> dict[int, int]:
             title=src.title,
             specialization=src.specialization,
             bio=src.bio,
+            bio_en=getattr(src, "bio_en", None),
             photo_url=src.photo_url,
             active_flag=src.active_flag,
             created_by=src.created_by,

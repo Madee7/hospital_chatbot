@@ -218,7 +218,7 @@ async def receive_message(request: Request):
         # شجرة الردود والتحكم بالخطوات (شات بوت المستشفى)
         if current_step == "WELCOME":
             user_sessions[user_number]["step"] = "MAIN_MENU"
-            send_message(user_number, "مستشفى جامعة نيو جيزة ترحب بكم 🏥")
+            send_message(user_number, "دار الشفاء ترحب بكم 🏥")
             send_buttons(
                 to=user_number, 
                 text="أنا هنا لمساعدتك في العثور على الطبيب المناسب وحجز موعد. لنبدأ 👇", 

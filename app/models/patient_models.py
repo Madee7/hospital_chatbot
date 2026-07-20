@@ -25,9 +25,8 @@ class Patient(Base):
     """
     Patient model representing patient profiles in the system.
 
-    Stores patient information collected from WhatsApp interactions
-    including contact details, demographics, and optional medical
-    record numbers for existing patients.
+Stores patient information collected from WhatsApp interactions
+including contact details and demographics.
     """
     __tablename__ = "patients"
 
@@ -44,7 +43,6 @@ class Patient(Base):
     )
     whatsapp_phone: Mapped[str] = mapped_column(String(20), nullable=False)
     name: Mapped[Optional[str]] = mapped_column(String(255))
-    mrn: Mapped[Optional[str]] = mapped_column(String(50))
     dob: Mapped[Optional[str]] = mapped_column(String(10))  # YYYY-MM-DD format
     gender: Mapped[Optional[str]] = mapped_column(String(10))
     consent_status: Mapped[Optional[str]] = mapped_column(String(50))
@@ -92,5 +90,4 @@ class Patient(Base):
         Index('idx_patient_tenant', 'tenant_id'),
         Index('idx_patient_clinic', 'clinic_id'),
         Index('idx_patient_whatsapp_phone', 'whatsapp_phone'),
-        Index('idx_patient_mrn', 'mrn'),
     )

@@ -82,6 +82,10 @@ class Doctor(Base):
         Text
     )
 
+    bio_en: Mapped[Optional[str]] = mapped_column(
+        Text
+    )
+
     photo_url: Mapped[Optional[str]] = mapped_column(
         String(500)
     )

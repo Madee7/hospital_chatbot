@@ -6,8 +6,8 @@ from datetime import datetime, time
 
 from sqlalchemy.orm import Session
 
+from app.core import i18n_bot as i18n
 from app.core.config import (
-    CLINIC_DISPLAY_NAME,
     DEFAULT_CLINIC_ID,
     DEFAULT_TENANT_ID,
     RECEPTIONIST_WHATSAPP,
@@ -86,16 +86,12 @@ def create_handover(
     in_hours = _within_business_hours()
     if patient_message:
         patient_msg = patient_message
-    elif in_hours:
-        patient_msg = (
-            f"تم تحويلك لموظف استقبال في {CLINIC_DISPLAY_NAME}. "
-            "سيتواصل معك قريباً. شكراً لصبرك."
-        )
     else:
+        lang = i18n.normalize_lang(getattr(conversation, "language", None))
         patient_msg = (
-            f"تم تسجيل طلبك لدى استقبال {CLINIC_DISPLAY_NAME}. "
-            "نحن خارج أوقات العمل حالياً (الأحد–الخميس 9ص–5م تقريباً)، "
-            "وسنرد في أقرب وقت عمل."
+            i18n.handover_in_hours(lang)
+            if in_hours
+            else i18n.handover_after_hours(lang)
         )
     wa.send_text(phone, patient_msg)
     log_message(

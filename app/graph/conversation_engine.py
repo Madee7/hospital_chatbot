@@ -7,7 +7,7 @@ Doctor cards are sent via WhatsApp Flow ImageCarousel when enabled
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, TypedDict
 
 from langgraph.graph import END, StateGraph
@@ -19,7 +19,6 @@ from app.core.config import (
     DEFAULT_CLINIC_ID,
     DEFAULT_TENANT_ID,
     REQUIRE_DOB,
-    REQUIRE_MRN,
     RESCHEDULE_CUTOFF_HOURS,
     SLOT_HOLD_MINUTES,
     WHATSAPP_FLOW_CTA,
@@ -27,7 +26,10 @@ from app.core.config import (
     WHATSAPP_FLOW_ID,
 )
 from app.core import safety
-from app.db.enums import ConversationState, HandoverPriority, Language, MessageType, SlotStatus
+from app.db.enums import ConversationState, HandoverPriority, MessageType, SlotStatus
+from app.language.language_detector import detect_language
+from app.language.language_service import LanguageService, get_conversation_language
+from app.language.response_validator import ensure_response_language
 from app.models.appointment_models import AppointmentSlot
 from app.models.conversation_models import Conversation
 from app.services import (
@@ -35,13 +37,14 @@ from app.services import (
     doctor_service,
     flow_service,
     handover_service,
+    patient_service,
     whatsapp_client as wa,
 )
 from app.services.booking_service import BookingError
+from app.services import clinic_settings_service
 from app.services.conversation_service import (
     get_or_create_conversation,
     log_message,
-    set_conversation_language,
     set_conversation_state,
 )
 from app.services.choice_resolver import resolve_choice
@@ -60,6 +63,7 @@ class GraphState(TypedDict, total=False):
     db_session: Session
     conversation_id: int
     conversation_state: str
+    language: str
     handled: bool
 
 
@@ -70,7 +74,20 @@ def _sess(phone: str) -> dict[str, Any]:
 
 
 def _clear_draft(phone: str) -> None:
+    """Drop booking draft keys but keep the live conversation language."""
+    prev = _SESSION.get(phone) or {}
+    lang = prev.get("language")
     _SESSION.pop(phone, None)
+    if lang:
+        _sess(phone)["language"] = lang
+
+
+def _sess_clear_keep_lang(sess: dict[str, Any]) -> None:
+    """Clear draft keys on an existing session dict without dropping language."""
+    lang = sess.get("language")
+    sess.clear()
+    if lang:
+        sess["language"] = lang
 
 
 def _sess_missing(
@@ -84,12 +101,7 @@ def _sess_missing(
     if all(sess.get(k) is not None for k in keys):
         return False
     lang = _lang(conversation)
-    wa.send_text(
-        phone,
-        "Your booking session expired. Starting over from the menu."
-        if i18n.is_english(lang)
-        else "انتهت جلسة الحجز. نبدأ من جديد من القائمة.",
-    )
+    wa.send_text(phone, i18n.session_expired(lang))
     _clear_draft(phone)
     _send_main_menu(phone, db, conversation)
     return True
@@ -104,8 +116,95 @@ def _clear_options(phone: str) -> None:
     _sess(phone).pop("last_options", None)
 
 
+def _parse_hold_deadline(raw: Any) -> datetime | None:
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return raw
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", ""))
+    except ValueError:
+        return None
+
+
+def _store_hold_deadline(sess: dict[str, Any], hold_result: dict[str, Any] | None = None) -> None:
+    """Remember when the temporary slot hold expires (session-side timer)."""
+    raw = None
+    if hold_result:
+        raw = hold_result.get("hold_expires_at")
+    if not raw:
+        raw = (datetime.utcnow() + timedelta(minutes=SLOT_HOLD_MINUTES)).isoformat(
+            sep=" ", timespec="seconds"
+        )
+    sess["hold_deadline"] = str(raw)
+
+
+def _hold_deadline_passed(sess: dict[str, Any]) -> bool:
+    deadline = _parse_hold_deadline(sess.get("hold_deadline"))
+    if deadline is None:
+        return False
+    return datetime.utcnow() >= deadline
+
+
+def _is_hold_timeout_error(exc: BaseException | str) -> bool:
+    text = str(exc).lower()
+    return "hold expired" in text or "slot hold expired" in text
+
+
+def _notify_booking_hold_timeout(
+    phone: str,
+    db: Session,
+    conversation: Conversation,
+    *,
+    reschedule: bool = False,
+) -> None:
+    """Apologize for hold timeout, drop the draft, and return to the main menu."""
+    lang = _lang(conversation, _sess(phone))
+    msg = (
+        i18n.reschedule_hold_timeout_apology(lang)
+        if reschedule
+        else i18n.hold_timeout_apology(lang)
+    )
+    # Best-effort: free the held slot if it is still ours.
+    sess = _sess(phone)
+    slot_id = sess.get("slot_id")
+    if slot_id:
+        try:
+            booking_service.release_expired_holds(db, clinic_id=DEFAULT_CLINIC_ID)
+            slot_row = (
+                db.query(AppointmentSlot)
+                .filter(AppointmentSlot.slot_id == int(slot_id))
+                .one_or_none()
+            )
+            if slot_row and slot_row.status == SlotStatus.HELD:
+                slot_row.status = SlotStatus.AVAILABLE
+                slot_row.hold_expires_at = None
+                slot_row.updated_by = "hold_timeout_user"
+                db.commit()
+        except Exception as exc:  # pragma: no cover
+            print(f"[hold_timeout] release failed: {exc}")
+    wa.send_text(phone, msg)
+    _finish_flow_quietly(phone, db, conversation)
+
+
+def _abort_if_hold_timed_out(
+    phone: str,
+    db: Session,
+    conversation: Conversation,
+    sess: dict[str, Any],
+    *,
+    reschedule: bool = False,
+) -> bool:
+    """If the booking hold window elapsed, apologize and stop. Returns True when aborted."""
+    if not _hold_deadline_passed(sess):
+        return False
+    _notify_booking_hold_timeout(phone, db, conversation, reschedule=reschedule)
+    return True
+
+
 def _offer_buttons(phone: str, body: str, buttons: list[str] | list[dict[str, str]]):
     """Send reply buttons and remember them for typed number/name selection."""
+    lang = _sess(phone).get("language") or "ar"
     opts = []
     for i, item in enumerate(buttons[:3]):
         if isinstance(item, dict):
@@ -114,43 +213,30 @@ def _offer_buttons(phone: str, body: str, buttons: list[str] | list[dict[str, st
         else:
             title = str(item)
             oid = title
-        opts.append({"id": oid, "title": title, "description": f"خيار رقم {i + 1}"})
+        opts.append(
+            {
+                "id": oid,
+                "title": title,
+                "description": i18n.option_number_description(lang, i + 1),
+            }
+        )
     _remember_options(phone, opts)
     return wa.send_buttons(phone, body, buttons)
 
 
-def _lang(conversation: Conversation) -> str:
-    return i18n.normalize_lang(conversation.language)
+def _lang(conversation: Conversation, session: dict[str, Any] | None = None) -> str:
+    """Current conversation language (session mirror → DB → default ar)."""
+    return get_conversation_language(conversation, session)
 
 
-def _send_language_select(phone: str, db: Session, conversation: Conversation) -> None:
-    _offer_buttons(
-        phone,
-        i18n.language_prompt(),
-        [
-            {"id": "lang_ar", "title": "العربية"},
-            {"id": "lang_en", "title": "الانجليزية"},
-        ],
-    )
-    set_conversation_state(
-        db,
-        conversation,
-        ConversationState.LANGUAGE_SELECT,
-        current_intent="language_select",
-    )
-    log_message(
-        db,
-        conversation_id=conversation.conversation_id,
-        direction="outbound",
-        message_type=MessageType.INTERACTIVE_REPLY,
-        text=i18n.language_prompt(),
-        status="sent",
-    )
-    db.commit()
+def _send_text(phone: str, text: str, lang: str | None = None) -> None:
+    """Send WhatsApp text after optional language validation (LLM-safe)."""
+    body = ensure_response_language(text, lang) if lang else text
+    wa.send_text(phone, body)
 
 
 def _send_main_menu(phone: str, db: Session, conversation: Conversation) -> None:
-    lang = _lang(conversation)
+    lang = _lang(conversation, _sess(phone))
     rows = i18n.main_menu_rows(lang)
     wa.send_text(phone, i18n.welcome(lang))
     _offer_list(
@@ -173,6 +259,15 @@ def _send_main_menu(phone: str, db: Session, conversation: Conversation) -> None
         message_type=MessageType.INTERACTIVE_REPLY,
         text=i18n.main_menu(lang),
         status="sent",
+    )
+    db.commit()
+
+
+def _finish_flow_quietly(phone: str, db: Session, conversation: Conversation) -> None:
+    """End booking/reschedule/cancel without auto-sending the welcome menu."""
+    _clear_draft(phone)
+    set_conversation_state(
+        db, conversation, ConversationState.MAIN_MENU, current_intent="idle"
     )
     db.commit()
 
@@ -203,24 +298,84 @@ def _offer_list(
     )
 
 
-def _resolve_free_text_choice(phone: str, text: str, payload_id: str) -> str:
+def _resolve_free_text_choice(
+    phone: str,
+    text: str,
+    payload_id: str,
+    *,
+    lang: str | None = None,
+) -> str:
     """
     If user typed instead of tapping a list/button, map text → option id.
     LLM only selects; bot replies stay canned in the flow below.
     """
-    if payload_id:
-        return payload_id
+    options = _sess(phone).get("last_options") or []
+    payload = (payload_id or "").strip()
+    if payload:
+        # Exact remembered id (stable button ids like path_by_doctor).
+        for opt in options:
+            oid = str(opt.get("id") or "")
+            if payload == oid:
+                return oid
+        # Legacy auto ids: btn_0_..., btn_1_... → map by index.
+        if payload.startswith("btn_"):
+            try:
+                idx = int(payload.split("_", 2)[1])
+                if 0 <= idx < len(options):
+                    return str(options[idx].get("id") or payload)
+            except (IndexError, ValueError):
+                pass
+        return payload
     text = (text or "").strip()
     if not text:
         return text
-    options = _sess(phone).get("last_options") or []
     if not options:
         return text
-    resolved = resolve_choice(text, options)
+    resolved = resolve_choice(text, options, lang=lang)
     if resolved:
-        print(f"[choice] mapped {text!r} -> {resolved!r}")
+        try:
+            print(f"[choice] mapped {text!r} -> {resolved!r}")
+        except UnicodeEncodeError:
+            print("[choice] mapped text -> option")
         return resolved
     return text
+
+
+def _is_booking_path_choice(
+    choice: str,
+    text: str,
+    aliases: set[str],
+) -> bool:
+    """Match path buttons by id, title, or legacy WhatsApp btn_* payload."""
+    c = (choice or "").strip()
+    t = (text or "").strip()
+    if c in aliases or t in aliases:
+        return True
+    # Legacy payloads like btn_1_باسم الدكت
+    for alias in aliases:
+        if alias and (alias in c or alias in t):
+            return True
+    return False
+
+
+def _advance_after_patient_name(
+    phone: str,
+    sess: dict[str, Any],
+    *,
+    lang: str,
+) -> bool:
+    """After name is accepted: ask DOB if required, else go to booking summary.
+
+    Returns True when a prompt was already sent (caller should return).
+    Returns False when awaiting=summary so the same turn can show the summary.
+    """
+    if REQUIRE_DOB:
+        sess["awaiting"] = "dob_value"
+        _clear_options(phone)
+        wa.send_text(phone, i18n.ask_dob(lang))
+        return True
+    sess["awaiting"] = "summary"
+    return False
 
 
 def _arabic_weekday(dt: datetime) -> str:
@@ -258,29 +413,54 @@ def _parse_slot_dt(value: str | datetime) -> datetime | None:
         return None
 
 
+def _format_time_compact(dt: datetime, lang: str | None = "ar") -> str:
+    """Short 12h clock for WhatsApp list titles (keep ranges under 24 chars)."""
+    hour12 = dt.hour % 12 or 12
+    minute = f"{dt.minute:02d}"
+    if i18n.is_english(lang):
+        suffix = "AM" if dt.hour < 12 else "PM"
+        return f"{hour12}:{minute} {suffix}"
+    suffix = "ص" if dt.hour < 12 else "م"
+    return f"{hour12}:{minute} {suffix}"
+
+
 def _slot_option_row(slot: dict, lang: str | None = "ar") -> dict[str, str]:
-    """12-hour localized title/description for WhatsApp slot lists."""
+    """One-line slot title (e.g. 10:00 AM–10:30 AM); no description to avoid double lines."""
     start = _parse_slot_dt(slot.get("slot_start"))
     end = _parse_slot_dt(slot.get("slot_end"))
     if start is None:
         raw = str(slot.get("slot_start") or "")
         title = raw.split(" ")[-1][:24] if raw else "?"
         return {"id": f"slot_{slot['slot_id']}", "title": title, "description": ""}
-    title = _format_time(start, lang)[:24]
+    start_label = _format_time_compact(start, lang)
     if end is not None:
-        joiner = "to" if i18n.is_english(lang) else "إلى"
-        description = f"{joiner} {_format_time(end, lang)}"[:72]
+        end_label = _format_time_compact(end, lang)
+        # Prefer en-dash so start–end fits WhatsApp's 24-char title limit.
+        title = f"{start_label}–{end_label}"[:24]
     else:
-        description = ""
+        title = start_label[:24]
     return {
         "id": f"slot_{slot['slot_id']}",
         "title": title,
-        "description": description,
+        "description": "",
     }
 
 
 def _slot_list_rows(slots: list[dict], lang: str | None = "ar") -> list[dict[str, str]]:
     return [_slot_option_row(s, lang) for s in slots[:10]]
+
+
+def _filter_bookable_slots(slots: list[dict]) -> list[dict]:
+    """Drop slots that violate MIN_LEAD_HOURS so users never pick an invalid time."""
+    from app.services.slot_service import earliest_bookable_at
+
+    min_start = earliest_bookable_at()
+    out: list[dict] = []
+    for slot in slots:
+        start = _parse_slot_dt(slot.get("slot_start"))
+        if start is None or start >= min_start:
+            out.append(slot)
+    return out
 
 
 def _date_option_title(date_str: str, lang: str | None = "ar") -> str:
@@ -299,22 +479,79 @@ def _date_option_title(date_str: str, lang: str | None = "ar") -> str:
 
 
 def _date_list_rows(dates: list[str], lang: str | None = "ar") -> list[dict[str, str]]:
+    """Date rows: title only (no description) so WhatsApp doesn't show the date twice."""
     return [
         {
             "id": f"date_{d}",
             "title": _date_option_title(d, lang),
-            "description": d,
+            "description": "",
         }
         for d in dates[:10]
     ]
 
 
-def _choice(state: GraphState) -> str:
+def _choice(state: GraphState, *, lang: str | None = None) -> str:
     """Prefer interactive payload id; otherwise map typed text to last options."""
     payload = (state.get("payload_id") or "").strip()
     text = (state.get("text") or "").strip()
     phone = state.get("phone") or ""
-    return _resolve_free_text_choice(phone, text, payload)
+    return _resolve_free_text_choice(phone, text, payload, lang=lang)
+
+
+def _offer_doctors_by_name_list(phone: str, db: Session, conversation: Conversation) -> bool:
+    """List all active doctors (name + specialty) for the 'by doctor name' path."""
+    lang = _lang(conversation, _sess(phone))
+    doctors = doctor_service.list_active_doctors(db, DEFAULT_CLINIC_ID, limit=10)
+    if not doctors:
+        _offer_buttons(
+            phone,
+            i18n.no_doctors_available(lang),
+            i18n.no_doctors_alt_buttons(lang),
+        )
+        _sess(phone)["awaiting"] = "no_slots_alt"
+        return False
+
+    rows = []
+    for doc in doctors:
+        fields = i18n.doctor_display_fields(doc, lang)
+        name = (fields.get("name") or f"Doctor {doc.doctor_id}")[:24]
+        specialty = (fields.get("specialization") or "")[:72]
+        rows.append(
+            {
+                "id": f"doctor_{doc.doctor_id}",
+                "title": name,
+                "description": specialty,
+            }
+        )
+    _offer_list(
+        phone,
+        body=i18n.doctors_by_name_prompt(lang),
+        button_label=i18n.doctors_list_button_label(lang),
+        rows=rows,
+        section_title=i18n.doctors_list_button_label(lang),
+    )
+    return True
+
+
+def _show_selected_doctor_card(
+    phone: str,
+    db: Session,
+    doctor_id: int,
+    *,
+    lang: str,
+) -> None:
+    """Send only the chosen doctor's card before continuing booking."""
+    doctor = doctor_service.get_doctor(db, doctor_id, clinic_id=DEFAULT_CLINIC_ID)
+    if not doctor:
+        return
+    card = doctor_service.doctor_card_payload(doctor)
+    # Location belongs on booking confirmation, not the doctor card.
+    wa.send_doctor_cards(
+        phone,
+        [card],
+        lang=lang,
+        include_button=False,
+    )
 
 
 def _show_doctor_cards(phone: str, db: Session, department_id: int | None) -> bool:
@@ -340,18 +577,11 @@ def _show_doctor_cards(phone: str, db: Session, department_id: int | None) -> bo
     else:
         doctors = doctor_service.list_active_doctors(db, DEFAULT_CLINIC_ID, limit=5)
     if not doctors:
-        if i18n.is_english(lang):
-            _offer_buttons(
-                phone,
-                "No doctors available for this option right now.",
-                ["By specialty", "Talk to reception", "Menu"],
-            )
-        else:
-            _offer_buttons(
-                phone,
-                "لا يوجد أطباء متاحون لهذا الخيار حالياً.",
-                ["بالتخصص", "موظف استقبال", "القائمة"],
-            )
+        _offer_buttons(
+            phone,
+            i18n.no_doctors_for_option(lang),
+            i18n.no_doctors_alt_buttons(lang),
+        )
         _sess(phone)["awaiting"] = "no_slots_alt"
         return False
 
@@ -369,11 +599,7 @@ def _show_doctor_cards(phone: str, db: Session, department_id: int | None) -> bo
                     phone,
                     flow_id=WHATSAPP_FLOW_ID,
                     screen_data=screen_data,
-                    body=(
-                        "Open the screen to swipe doctor photos, then pick a doctor."
-                        if i18n.is_english(lang)
-                        else "افتح الشاشة لتمرير صور الأطباء يمين ويسار، ثم اختر الطبيب من القائمة."
-                    ),
+                    body=i18n.doctor_flow_prompt(lang),
                     cta=WHATSAPP_FLOW_CTA,
                     draft=WHATSAPP_FLOW_DRAFT,
                 )
@@ -387,11 +613,7 @@ def _show_doctor_cards(phone: str, db: Session, department_id: int | None) -> bo
                             phone,
                             flow_id=WHATSAPP_FLOW_ID,
                             screen_data=screen_data,
-                            body=(
-                                "Open the screen to swipe doctor photos, then pick a doctor."
-                                if i18n.is_english(lang)
-                                else "افتح الشاشة لتمرير صور الأطباء يمين ويسار، ثم اختر الطبيب من القائمة."
-                            ),
+                            body=i18n.doctor_flow_prompt(lang),
                             cta=WHATSAPP_FLOW_CTA,
                             draft=True,
                         )
@@ -423,107 +645,182 @@ def _show_doctor_cards(phone: str, db: Session, department_id: int | None) -> bo
     return True
 
 
-def _format_appt_row_title(appt: dict) -> str:
+def _appt_list_row(appt: dict, lang: str | None = "ar") -> dict[str, str]:
+    """WhatsApp list row: doctor name on top, date/time below (no appointment ref)."""
     start: datetime = appt["slot_start"]
-    ref = (appt.get("appointment_ref") or str(appt["appointment_id"]))[-8:]
-    from app.core.time_format import format_time_12h
+    doctor = i18n.doctor_display_name(appt, lang).strip() or "—"
+    when = f"{_format_date(start, lang)} · {_format_time(start, lang)}"
+    return {
+        "id": f"appt_{appt['appointment_id']}",
+        "title": doctor[:24],
+        "description": when[:72],
+    }
 
-    return f"{ref} {start.strftime('%m-%d')} {format_time_12h(start, 'en')}"[:24]
+
+def _appt_session_info(appt: dict, lang: str | None = "ar") -> dict[str, Any]:
+    """Normalize an upcoming-appointment dict for the in-memory session."""
+    start = appt.get("slot_start")
+    if isinstance(start, datetime):
+        start_s = start.isoformat(sep=" ", timespec="minutes")
+    else:
+        start_s = str(start or "")
+    return {
+        "doctor_id": appt["doctor_id"],
+        "name_ar": appt.get("name_ar"),
+        "name_en": appt.get("name_en"),
+        "doctor_name": i18n.doctor_display_name(appt, lang),
+        "slot_start": start_s,
+        "appointment_ref": appt.get("appointment_ref"),
+        "specialization": appt.get("specialization"),
+    }
+
+
+def _resolve_upcoming_pick(
+    db: Session,
+    phone: str,
+    sess: dict[str, Any],
+    *,
+    choice: str,
+    text: str,
+) -> tuple[int | None, dict[str, Any] | None]:
+    """Resolve list/ref/name pick; rebuild session cache from DB when needed."""
+    hit = booking_service.find_upcoming_appointment_choice(
+        db,
+        clinic_id=DEFAULT_CLINIC_ID,
+        whatsapp_phone=phone,
+        choice=choice,
+        text=text,
+        cached=sess.get("upcoming"),
+    )
+    if not hit:
+        return None, None
+    appt_id = int(hit["appointment_id"])
+    info = _appt_session_info(hit, sess.get("language") or "ar")
+    upcoming = dict(sess.get("upcoming") or {})
+    upcoming[str(appt_id)] = info
+    sess["upcoming"] = upcoming
+    return appt_id, info
 
 
 def _start_reschedule_flow(phone: str, db: Session, conversation: Conversation) -> None:
+    lang = _lang(conversation)
     upcoming = booking_service.list_upcoming_appointments_for_phone(
         db, clinic_id=DEFAULT_CLINIC_ID, whatsapp_phone=phone
     )
     if not upcoming:
-        wa.send_text(phone, "لا يوجد لديك مواعيد مؤكدة قادمة للتعديل.")
-        _send_main_menu(phone, db, conversation)
+        wa.send_text(phone, i18n.no_upcoming_to_reschedule(lang))
+        _finish_flow_quietly(phone, db, conversation)
         return
 
     set_conversation_state(
         db, conversation, ConversationState.RESCHEDULE, current_intent="reschedule"
     )
     sess = _sess(phone)
-    sess.clear()
+    _sess_clear_keep_lang(sess)
     sess["awaiting"] = "pick_appointment"
     sess["upcoming"] = {
-        str(a["appointment_id"]): {
-            "doctor_id": a["doctor_id"],
-            "doctor_name": a.get("doctor_name"),
-            "slot_start": a["slot_start"].isoformat(sep=" ", timespec="minutes"),
-            "appointment_ref": a.get("appointment_ref"),
-            "specialization": a.get("specialization"),
-        }
+        str(a["appointment_id"]): _appt_session_info(a, lang)
         for a in upcoming
     }
     _offer_list(
         phone,
-        body="اختر الموعد الذي تريد تعديله (أو اكتب رقم الموعد):",
-        button_label="مواعيدك",
-        rows=[
-            {
-                "id": f"appt_{a['appointment_id']}",
-                "title": _format_appt_row_title(a),
-                "description": (a.get("doctor_name") or "")[:72],
-            }
-            for a in upcoming[:10]
-        ],
-        section_title="المواعيد",
+        body=i18n.pick_appointment_to_reschedule(lang),
+        button_label=i18n.your_appointments_label(lang),
+        rows=[_appt_list_row(a, lang) for a in upcoming[:10]],
+        section_title=i18n.appointments_section(lang),
     )
     db.commit()
 
 
-def _offer_reschedule_change_type(phone: str, sess: dict) -> None:
+def _offer_reschedule_change_type(phone: str, sess: dict, lang: str | None = None) -> None:
     info = sess.get("current_appt") or {}
     start = datetime.fromisoformat(info["slot_start"])
-    summary = (
-        "موعدك الحالي:\n"
-        f"- رقم الموعد: {info.get('appointment_ref')}\n"
-        f"- الطبيب: {info.get('doctor_name') or ''}\n"
-        f"- التاريخ: {_format_date(start)}\n"
-        f"- الوقت: {_format_time(start)}\n\n"
-        "ماذا تريد تغييره؟"
+    code = lang or "ar"
+    doctor_name = i18n.doctor_display_name(info, code) or info.get("doctor_name")
+    summary = i18n.current_appointment_change_prompt(
+        code,
+        doctor_name=doctor_name,
+        date_label=_format_date(start, code),
+        time_label=_format_time(start, code),
     )
-    _offer_buttons(phone, summary, ["تغيير الوقت", "تغيير الطبيب", "رجوع"])
+    _offer_buttons(phone, summary, i18n.reschedule_change_buttons(code))
+
+
+def _offer_reschedule_day_picker(phone: str, db: Session, sess: dict, lang: str) -> bool:
+    """Same doctor, pick a new day then time. Returns False if no dates."""
+    booking_service.release_expired_holds(db, clinic_id=DEFAULT_CLINIC_ID)
+    avail = booking_service.get_available_dates_and_slots(
+        db, doctor_id=sess["doctor_id"], clinic_id=DEFAULT_CLINIC_ID
+    )
+    dates = list(avail.get("dates", {}).keys())
+    if not dates:
+        wa.send_text(phone, i18n.no_alternative_slots(lang))
+        return False
+    sess["awaiting"] = "date"
+    _offer_list(
+        phone,
+        body=i18n.choose_new_day(lang),
+        button_label=i18n.days_button_label(lang),
+        rows=_date_list_rows(dates, lang),
+        section_title=i18n.dates_section_title(lang),
+    )
+    return True
+
+
+def _offer_reschedule_same_day_slots(
+    phone: str, db: Session, sess: dict, lang: str
+) -> bool:
+    """Same doctor + same day, pick a new time only. Returns False if none."""
+    info = sess.get("current_appt") or {}
+    start = datetime.fromisoformat(info["slot_start"])
+    selected_date = start.date().isoformat()
+    sess["selected_date"] = selected_date
+    booking_service.release_expired_holds(db, clinic_id=DEFAULT_CLINIC_ID)
+    avail = booking_service.get_available_dates_and_slots(
+        db, doctor_id=sess["doctor_id"], clinic_id=DEFAULT_CLINIC_ID
+    )
+    day_slots = _filter_bookable_slots(avail.get("dates", {}).get(selected_date) or [])
+    if not day_slots:
+        wa.send_text(phone, i18n.no_other_times_same_day(lang))
+        return False
+    sess["awaiting"] = "slot"
+    date_label = _date_option_title(selected_date, lang)
+    _offer_list(
+        phone,
+        body=i18n.choose_same_day_time(lang, date_label),
+        button_label=i18n.times_button_label(lang),
+        rows=_slot_list_rows(day_slots, lang),
+        section_title=i18n.slots_section_title(lang),
+    )
+    return True
 
 
 def _start_cancel_flow(phone: str, db: Session, conversation: Conversation) -> None:
+    lang = _lang(conversation)
     upcoming = booking_service.list_upcoming_appointments_for_phone(
         db, clinic_id=DEFAULT_CLINIC_ID, whatsapp_phone=phone
     )
     if not upcoming:
-        wa.send_text(phone, "لا يوجد لديك مواعيد مؤكدة قادمة للإلغاء.")
-        _send_main_menu(phone, db, conversation)
+        wa.send_text(phone, i18n.no_upcoming_to_cancel(lang))
+        _finish_flow_quietly(phone, db, conversation)
         return
 
     set_conversation_state(
         db, conversation, ConversationState.CANCEL, current_intent="cancel"
     )
     sess = _sess(phone)
-    sess.clear()
+    _sess_clear_keep_lang(sess)
     sess["awaiting"] = "pick_appointment"
     sess["upcoming"] = {
-        str(a["appointment_id"]): {
-            "doctor_id": a["doctor_id"],
-            "doctor_name": a.get("doctor_name"),
-            "slot_start": a["slot_start"].isoformat(sep=" ", timespec="minutes"),
-            "appointment_ref": a.get("appointment_ref"),
-        }
+        str(a["appointment_id"]): _appt_session_info(a, lang)
         for a in upcoming
     }
     _offer_list(
         phone,
-        body="اختر الموعد للإلغاء، أو اكتب رقم الموعد:",
-        button_label="مواعيدك",
-        rows=[
-            {
-                "id": f"appt_{a['appointment_id']}",
-                "title": _format_appt_row_title(a),
-                "description": (a.get("doctor_name") or "")[:72],
-            }
-            for a in upcoming[:10]
-        ],
-        section_title="المواعيد",
+        body=i18n.pick_appointment_to_cancel(lang),
+        button_label=i18n.your_appointments_label(lang),
+        rows=[_appt_list_row(a, lang) for a in upcoming[:10]],
+        section_title=i18n.appointments_section(lang),
     )
     db.commit()
 
@@ -543,36 +840,16 @@ def continue_after_doctor_selected(
     )
     sess = _sess(phone)
     sess["doctor_id"] = doctor_id
+    lang = _lang(conversation)
     doctor = doctor_service.get_doctor(db, doctor_id, clinic_id=DEFAULT_CLINIC_ID)
     if not doctor:
-        wa.send_text(phone, "تعذر العثور على الطبيب المختار.")
+        wa.send_text(phone, i18n.doctor_not_found(lang))
         return
 
-    # UC-005 inquiry: show details + optional book CTA (no auto-booking)
+    # Inquiry used to ask "book with this doctor?" after Select — redundant once
+    # the patient already tapped a doctor card / list row. Continue into booking.
     if sess.get("flow") == "inquiry":
-        name = doctor.name_ar or doctor.name_en or ""
-        fields = i18n.doctor_display_fields(doctor, _lang(conversation))
-        name = fields["name"] or name
-        body = (
-            f"{name}\n"
-            f"{'Specialty' if i18n.is_english(_lang(conversation)) else 'التخصص'}: {fields['specialization'] or ''}\n"
-            f"{(fields['bio'] or '')[:200]}\n\n"
-            + (
-                "Would you like to book with this doctor?"
-                if i18n.is_english(_lang(conversation))
-                else "هل تريد الحجز مع هذا الطبيب؟"
-            )
-        )
-        sess["awaiting"] = "inquiry_book_cta"
-        set_conversation_state(
-            db, conversation, ConversationState.BOOKING_DOCTOR, current_intent="inquiry"
-        )
-        if i18n.is_english(_lang(conversation)):
-            _offer_buttons(phone, body, ["Book with doctor", "Menu"])
-        else:
-            _offer_buttons(phone, body, ["حجز معه", "القائمة"])
-        db.commit()
-        return
+        sess["flow"] = "booking"
 
     sess["awaiting"] = None
     booking_service.release_expired_holds(db, clinic_id=DEFAULT_CLINIC_ID)
@@ -583,8 +860,8 @@ def continue_after_doctor_selected(
     if not dates:
         _offer_buttons(
             phone,
-            "لا توجد مواعيد متاحة لهذا الطبيب حالياً. اختر خياراً:",
-            ["طبيب آخر", "موظف استقبال", "القائمة"],
+            i18n.no_slots_for_doctor(lang),
+            i18n.no_slots_alt_buttons(lang),
         )
         sess["awaiting"] = "no_slots_alt"
         db.commit()
@@ -596,17 +873,12 @@ def continue_after_doctor_selected(
             db, conversation, ConversationState.RESCHEDULE, current_intent="reschedule"
         )
         sess["awaiting"] = "date"
-        lang = _lang(conversation)
         _offer_list(
             phone,
-            body=(
-                "Choose the new appointment day:"
-                if i18n.is_english(lang)
-                else "اختر اليوم الجديد للموعد:"
-            ),
-            button_label="Days" if i18n.is_english(lang) else "الأيام",
+            body=i18n.choose_new_day(lang),
+            button_label=i18n.days_button_label(lang),
             rows=_date_list_rows(dates, lang),
-            section_title="Dates" if i18n.is_english(lang) else "التواريخ",
+            section_title=i18n.dates_section_title(lang),
         )
         db.commit()
         return
@@ -614,17 +886,12 @@ def continue_after_doctor_selected(
     set_conversation_state(
         db, conversation, ConversationState.BOOKING_DATE, current_intent="booking_date"
     )
-    lang = _lang(conversation)
     _offer_list(
         phone,
-        body=(
-            "Choose a suitable day:"
-            if i18n.is_english(lang)
-            else "اختر اليوم المناسب:"
-        ),
-        button_label="Days" if i18n.is_english(lang) else "الأيام",
+        body=i18n.choose_day(lang),
+        button_label=i18n.days_button_label(lang),
         rows=_date_list_rows(dates, lang),
-        section_title="Dates" if i18n.is_english(lang) else "التواريخ",
+        section_title=i18n.dates_section_title(lang),
     )
     db.commit()
 
@@ -664,7 +931,7 @@ def node_handle(state: GraphState) -> GraphState:
     db: Session = state["db_session"]
     phone = state["phone"]
     text = (state.get("text") or "").strip()
-    choice = _choice(state)
+    payload_id = (state.get("payload_id") or "").strip()
     sess = _sess(phone)
     conversation = (
         db.query(Conversation)
@@ -672,8 +939,15 @@ def node_handle(state: GraphState) -> GraphState:
         .one()
     )
     conv_state = state.get("conversation_state") or ConversationState.NEW.value
-    intent = detect_intent(text or choice)
-    lang = _lang(conversation)
+
+    # ---- Per-message language detection (before any LLM / reply work) ----
+    lang_svc = LanguageService(db, conversation, sess)
+    lang = lang_svc.sync_from_user_text(text, payload_id=payload_id)
+    db.commit()
+
+    choice = _choice(state, lang=lang)
+    intent = detect_intent(text or choice, lang=lang)
+    state = {**state, "language": lang}
 
     # ---- BR-015: high-risk medical language → urgent handover (no advice) ----
     if safety.is_high_risk_medical(text) or safety.is_high_risk_medical(choice):
@@ -687,29 +961,52 @@ def node_handle(state: GraphState) -> GraphState:
         _clear_draft(phone)
         return {**state, "handled": True}
 
-    # ---- First-contact language selection ----
-    needs_lang = conversation.language is None or conv_state == ConversationState.LANGUAGE_SELECT.value
-    if needs_lang:
-        picked = None
-        if choice in i18n.LANG_AR_CHOICES or text in i18n.LANG_AR_CHOICES:
-            picked = Language.AR
-        elif choice in i18n.LANG_EN_CHOICES or text in i18n.LANG_EN_CHOICES:
-            picked = Language.EN
-        if picked is None and conv_state == ConversationState.LANGUAGE_SELECT.value:
-            _send_language_select(phone, db, conversation)
-            return {**state, "handled": True}
-        if picked is None and conversation.language is None:
-            _send_language_select(phone, db, conversation)
-            return {**state, "handled": True}
-        if picked is not None:
-            set_conversation_language(db, conversation, picked)
-            wa.send_text(phone, i18n.language_saved(picked))
-            db.commit()
-            _send_main_menu(phone, db, conversation)
-            return {**state, "handled": True}
+    # ---- Language bootstrap (auto-detect; no language-select screen) ----
+    in_lang_select = conv_state == ConversationState.LANGUAGE_SELECT.value
+    # Digits "1"/"2" only mean language while on a leftover language-select screen.
+    lang_ar_labels = set(i18n.LANG_AR_CHOICES)
+    lang_en_labels = set(i18n.LANG_EN_CHOICES)
+    if not in_lang_select:
+        lang_ar_labels.discard("1")
+        lang_en_labels.discard("2")
+    explicit_ar = choice in lang_ar_labels or text in lang_ar_labels
+    explicit_en = choice in lang_en_labels or text in lang_en_labels
 
-    # Global MENU
-    if intent == Intent.MENU or choice.upper() == "MENU" or text.upper() == "MENU":
+    if conversation.language is None or in_lang_select:
+        sample = text or choice or payload_id
+        detected = detect_language(sample, fallback=None)
+        if explicit_ar:
+            lang = lang_svc.set_language("ar")
+        elif explicit_en:
+            lang = lang_svc.set_language("en")
+        elif detected is not None:
+            lang = lang_svc.set_language(detected)
+        elif conversation.language is None:
+            # MENU / منيو / numbers / empty → default Arabic (never ask again).
+            lang = lang_svc.set_language("ar")
+        else:
+            lang = _lang(conversation, sess)
+        db.commit()
+
+        # Escape leftover language_select state from older sessions.
+        if in_lang_select:
+            _send_main_menu(phone, db, conversation)
+            return {**state, "language": lang, "handled": True}
+
+    # Mid-conversation switch: language already updated on Conversation;
+    # continue the current flow in the new language (no extra confirmation).
+    lang = _lang(conversation, sess)
+    state = {**state, "language": lang}
+
+    # Global MENU — explicit command only (not greetings mid-flow).
+    menu_tokens = {"MENU", "منيو", "القائمة", "القائمه", "قائمة"}
+    explicit_menu = (
+        choice.strip().upper() == "MENU"
+        or text.strip().upper() == "MENU"
+        or choice.strip() in menu_tokens
+        or text.strip() in menu_tokens
+    )
+    if explicit_menu:
         _clear_draft(phone)
         _send_main_menu(phone, db, conversation)
         return {**state, "handled": True}
@@ -724,7 +1021,7 @@ def node_handle(state: GraphState) -> GraphState:
             "Book",
         } | i18n.BOOK_CHOICES
         if choice in rebook or text in rebook:
-            sess.clear()
+            _sess_clear_keep_lang(sess)
             sess["flow"] = "booking"
             set_conversation_state(
                 db,
@@ -736,12 +1033,12 @@ def node_handle(state: GraphState) -> GraphState:
             db.commit()
             return {**state, "handled": True}
         _clear_draft(phone)
-        _send_main_menu(phone, db, conversation)
+        _finish_flow_quietly(phone, db, conversation)
         return {**state, "handled": True}
 
     # UC-006 voice transcript confirmation
     if sess.get("awaiting") == "voice_confirm":
-        if choice in {"نعم صحيح"} or text in {"نعم صحيح", "نعم", "تأكيد", "Yes", "Confirm"}:
+        if choice in i18n.VOICE_CONFIRM_CHOICES or text in i18n.VOICE_CONFIRM_CHOICES:
             transcript = sess.pop("voice_transcript", "") or ""
             sess["awaiting"] = None
             if transcript:
@@ -753,21 +1050,11 @@ def node_handle(state: GraphState) -> GraphState:
                     message_type="text",
                 )
                 return {**state, "handled": True}
-            wa.send_text(
-                phone,
-                "Please resend your request as text or voice."
-                if i18n.is_english(lang)
-                else "أعد إرسال الطلب نصاً أو صوتياً.",
-            )
+            wa.send_text(phone, i18n.voice_resend(lang))
             return {**state, "handled": True}
         _clear_draft(phone)
-        wa.send_text(
-            phone,
-            "OK — please type or record your request clearly."
-            if i18n.is_english(lang)
-            else "حسناً، أعد كتابة أو تسجيل طلبك بوضوح.",
-        )
-        _send_main_menu(phone, db, conversation)
+        wa.send_text(phone, i18n.voice_retry_clear(lang))
+        _finish_flow_quietly(phone, db, conversation)
         return {**state, "handled": True}
 
     # ---- New / closed / greetings ----
@@ -807,7 +1094,7 @@ def node_handle(state: GraphState) -> GraphState:
                 current_intent="booking_started",
             )
             sess = _sess(phone)
-            sess.clear()
+            _sess_clear_keep_lang(sess)
             sess["flow"] = "booking"
             _offer_buttons(phone, i18n.booking_path_prompt(lang), i18n.booking_path_buttons(lang))
             db.commit()
@@ -826,7 +1113,7 @@ def node_handle(state: GraphState) -> GraphState:
                 current_intent="inquiry",
             )
             sess = _sess(phone)
-            sess.clear()
+            _sess_clear_keep_lang(sess)
             sess["flow"] = "inquiry"
             _offer_buttons(
                 phone,
@@ -850,20 +1137,23 @@ def node_handle(state: GraphState) -> GraphState:
             )
             return {**state, "handled": True}
 
-        if conv_state != ConversationState.MAIN_MENU.value or intent == Intent.UNKNOWN:
+        if intent == Intent.THANKS:
+            wa.send_text(phone, i18n.thanks_ack(lang))
+            return {**state, "handled": True}
+
+        # Greeting / menu intent / any free-text start while idle → open menu.
+        # Clear book/update/cancel/inquiry already routed above via rules+LLM.
+        if intent == Intent.MENU or (text or choice).strip():
             _send_main_menu(phone, db, conversation)
         return {**state, "handled": True}
 
     # ---- Booking: choose path / specialty / doctor ----
     if conv_state == ConversationState.BOOKING_DOCTOR.value:
         if sess.get("awaiting") == "inquiry_book_cta":
-            if choice in {"حجز معه", "Book with doctor"} or text in {
-                "حجز معه",
-                "Book with doctor",
-                "نعم",
-                "Yes",
-                "yes",
-            }:
+            if (
+                choice in i18n.INQUIRY_BOOK_CHOICES
+                or text in i18n.INQUIRY_BOOK_CHOICES
+            ):
                 doctor_id = int(sess.get("doctor_id") or 0)
                 sess["flow"] = "booking"
                 sess["awaiting"] = None
@@ -871,16 +1161,14 @@ def node_handle(state: GraphState) -> GraphState:
                     continue_after_doctor_selected(db, phone=phone, doctor_id=doctor_id)
                 return {**state, "handled": True}
             _clear_draft(phone)
-            _send_main_menu(phone, db, conversation)
+            _finish_flow_quietly(phone, db, conversation)
             return {**state, "handled": True}
 
         if sess.get("awaiting") == "no_slots_alt":
-            if choice in {"طبيب آخر", "بالتخصص", "By specialty", "Another doctor"} or text in {
-                "طبيب آخر",
-                "بالتخصص",
-                "By specialty",
-                "Another doctor",
-            }:
+            if (
+                choice in i18n.NO_SLOTS_RETRY_CHOICES
+                or text in i18n.NO_SLOTS_RETRY_CHOICES
+            ):
                 sess.pop("doctor_id", None)
                 sess["awaiting"] = None
                 _offer_buttons(
@@ -890,50 +1178,53 @@ def node_handle(state: GraphState) -> GraphState:
                 )
                 db.commit()
                 return {**state, "handled": True}
-            if choice in {"موظف استقبال", "Talk to reception"} or text in {
-                "موظف استقبال",
-                "Talk to reception",
-            }:
+            if (
+                choice in i18n.NO_SLOTS_HANDOVER_CHOICES
+                or text in i18n.NO_SLOTS_HANDOVER_CHOICES
+            ):
                 handover_service.create_handover(
                     db, phone=phone, reason="No slots/doctors available", priority=HandoverPriority.NORMAL
                 )
                 _clear_draft(phone)
                 return {**state, "handled": True}
             _clear_draft(phone)
-            _send_main_menu(phone, db, conversation)
+            _finish_flow_quietly(phone, db, conversation)
             return {**state, "handled": True}
 
     if conv_state == ConversationState.BOOKING_DOCTOR.value and not sess.get("doctor_id"):
-        if choice in i18n.PATH_SPECIALTY or text in i18n.PATH_SPECIALTY:
+        if _is_booking_path_choice(choice, text, i18n.PATH_SPECIALTY):
             departments = doctor_service.list_departments(db, DEFAULT_CLINIC_ID)
+            lang = _lang(conversation)
             if not departments:
                 _offer_buttons(
                     phone,
-                    "لا توجد تخصصات متاحة حالياً.",
-                    ["موظف استقبال", "القائمة"],
+                    i18n.no_departments(lang),
+                    i18n.no_departments_buttons(lang),
                 )
                 sess["awaiting"] = "no_slots_alt"
                 db.commit()
                 return {**state, "handled": True}
             _offer_list(
                 phone,
-                body="اختر التخصص:" if not i18n.is_english(_lang(conversation)) else "Choose a specialty:",
-                button_label="التخصصات" if not i18n.is_english(_lang(conversation)) else "Specialties",
+                body=i18n.choose_specialty(lang),
+                button_label=i18n.specialties_label(lang),
                 rows=[
                     {
                         "id": f"dept_{d.department_id}",
                         "title": (
-                            (d.name_en or d.name_ar)
-                            if i18n.is_english(_lang(conversation))
-                            else (d.name_ar or d.name_en)
+                            i18n.pick_bilingual_field(
+                                en=d.name_en,
+                                ar=d.name_ar,
+                                lang=lang,
+                                allow_cross_script=False,
+                                fallback=str(d.department_id),
+                            )
                             or str(d.department_id)
                         )[:24],
                     }
                     for d in departments
                 ],
-                section_title=(
-                    "Specialties" if i18n.is_english(_lang(conversation)) else "التخصصات"
-                ),
+                section_title=i18n.specialties_label(lang),
             )
             sess["awaiting"] = "department"
             db.commit()
@@ -946,14 +1237,23 @@ def node_handle(state: GraphState) -> GraphState:
             dept = doctor_service.find_department(db, DEFAULT_CLINIC_ID, name=text)
             department_id = dept.department_id if dept else None
 
-        if choice in i18n.PATH_ALL_DOCTORS or department_id is not None or (
+        if _is_booking_path_choice(choice, text, i18n.PATH_BY_DOCTOR_NAME):
+            # By doctor name → list names + specialties (not all cards at once)
+            ok = _offer_doctors_by_name_list(phone, db, conversation)
+            if ok:
+                sess["awaiting"] = "doctor"
+                sess["doctor_pick_mode"] = "by_name"
+                sess["department_id"] = None
+            db.commit()
+            return {**state, "handled": True}
+
+        if department_id is not None or (
             sess.get("awaiting") == "department" and department_id
         ):
-            if choice in i18n.PATH_ALL_DOCTORS:
-                department_id = None
             ok = _show_doctor_cards(phone, db, department_id)
             if ok:
                 sess["awaiting"] = "doctor"
+                sess["doctor_pick_mode"] = "by_specialty"
                 sess["department_id"] = department_id
             db.commit()
             return {**state, "handled": True}
@@ -963,13 +1263,28 @@ def node_handle(state: GraphState) -> GraphState:
             doctor_id = int(choice.replace("doctor_", ""))
         elif sess.get("awaiting") == "doctor":
             for doc in doctor_service.list_active_doctors(db, DEFAULT_CLINIC_ID, limit=20):
-                name = doc.name_ar or doc.name_en or ""
-                if name and name in text:
+                name_ar = (doc.name_ar or "").strip()
+                name_en = (doc.name_en or "").strip()
+                if (name_ar and name_ar in text) or (name_en and name_en.lower() in text.lower()):
                     doctor_id = doc.doctor_id
                     break
 
         if doctor_id:
+            lang = _lang(conversation, sess)
+            # Name-list path: show only the selected doctor's card, then continue.
+            if sess.get("doctor_pick_mode") == "by_name":
+                _show_selected_doctor_card(phone, db, doctor_id, lang=lang)
+            sess.pop("doctor_pick_mode", None)
             continue_after_doctor_selected(db, phone=phone, doctor_id=doctor_id)
+            return {**state, "handled": True}
+
+        # Already waiting for a doctor pick — don't re-ask specialty vs name.
+        if sess.get("awaiting") == "doctor":
+            if sess.get("doctor_pick_mode") == "by_name":
+                _offer_doctors_by_name_list(phone, db, conversation)
+            else:
+                _show_doctor_cards(phone, db, sess.get("department_id"))
+            db.commit()
             return {**state, "handled": True}
 
         _offer_buttons(phone, i18n.booking_path_prompt(_lang(conversation)), i18n.booking_path_buttons(_lang(conversation)))
@@ -985,9 +1300,11 @@ def node_handle(state: GraphState) -> GraphState:
         avail = booking_service.get_available_dates_and_slots(
             db, doctor_id=sess["doctor_id"], clinic_id=DEFAULT_CLINIC_ID
         )
-        day_slots = avail.get("dates", {}).get(selected_date) or []
+        day_slots = _filter_bookable_slots(
+            avail.get("dates", {}).get(selected_date) or []
+        )
         if not day_slots:
-            wa.send_text(phone, "لا توجد أوقات في هذا اليوم. اختر يوماً آخر.")
+            wa.send_text(phone, i18n.no_slots_on_day(_lang(conversation)))
             return {**state, "handled": True}
         set_conversation_state(
             db, conversation, ConversationState.BOOKING_SLOT, current_intent="booking_slot"
@@ -996,14 +1313,10 @@ def node_handle(state: GraphState) -> GraphState:
         date_label = _date_option_title(selected_date, lang)
         _offer_list(
             phone,
-            body=(
-                f"Choose a 30-min slot on {date_label}:"
-                if i18n.is_english(lang)
-                else f"اختر موعداً لمدة 30 دقيقة بتاريخ {date_label}:"
-            ),
-            button_label="Times" if i18n.is_english(lang) else "الأوقات",
+            body=i18n.choose_slot_on_date(lang, date_label),
+            button_label=i18n.times_button_label(lang),
             rows=_slot_list_rows(day_slots, lang),
-            section_title="Slots" if i18n.is_english(lang) else "المواعيد",
+            section_title=i18n.slots_section_title(lang),
         )
         db.commit()
         return {**state, "handled": True}
@@ -1013,11 +1326,11 @@ def node_handle(state: GraphState) -> GraphState:
         if _sess_missing(phone, db, conversation, "doctor_id"):
             return {**state, "handled": True}
         if not choice.startswith("slot_"):
-            wa.send_text(phone, "اختر الوقت من القائمة.")
+            wa.send_text(phone, i18n.choose_time_from_list(_lang(conversation)))
             return {**state, "handled": True}
         slot_id = int(choice.replace("slot_", ""))
         try:
-            booking_service.hold_slot(
+            hold_result = booking_service.hold_slot(
                 db,
                 slot_id=slot_id,
                 clinic_id=DEFAULT_CLINIC_ID,
@@ -1025,68 +1338,87 @@ def node_handle(state: GraphState) -> GraphState:
                 hold_minutes=SLOT_HOLD_MINUTES,
             )
         except BookingError as exc:
-            wa.send_text(phone, f"تعذر حجز الوقت مؤقتاً: {exc}")
+            wa.send_text(phone, i18n.hold_error(_lang(conversation), str(exc)))
             return {**state, "handled": True}
         sess["slot_id"] = slot_id
+        _store_hold_deadline(sess, hold_result)
         set_conversation_state(
             db, conversation, ConversationState.PATIENT_DETAILS, current_intent="patient_details"
         )
         _clear_options(phone)
-        wa.send_text(phone, "برجاء إدخال اسم المريض:")
-        sess["awaiting"] = "patient_name"
+        lang = _lang(conversation, sess)
+        existing = patient_service.find_patient_by_phone(
+            db, clinic_id=DEFAULT_CLINIC_ID, whatsapp_phone=phone
+        )
+        if existing and (existing.name or "").strip():
+            sess["known_patient_name"] = patient_service.normalize_person_name(existing.name)
+            sess["awaiting"] = "known_patient_confirm"
+            _offer_buttons(
+                phone,
+                i18n.known_patient_prompt(lang, sess["known_patient_name"]),
+                i18n.known_patient_buttons(lang),
+            )
+        else:
+            sess["awaiting"] = "patient_name"
+            wa.send_text(phone, i18n.ask_patient_full_name(lang))
         db.commit()
         return {**state, "handled": True}
 
     # ---- Patient details ----
     if conv_state == ConversationState.PATIENT_DETAILS.value:
-        if sess.get("awaiting") == "patient_name":
-            sess["patient_name"] = text
-            if REQUIRE_MRN:
-                sess["awaiting"] = "mrn_value"
-                _clear_options(phone)
-                wa.send_text(
-                    phone,
-                    "Please enter your MRN:"
-                    if i18n.is_english(_lang(conversation))
-                    else "برجاء إدخال رقم الملف الطبي (MRN):",
-                )
-            else:
-                sess["awaiting"] = "mrn_optional"
-                if i18n.is_english(_lang(conversation)):
-                    _offer_buttons(phone, "Do you have a medical record number (MRN)?", ["Skip", "Enter MRN"])
-                else:
-                    _offer_buttons(phone, "هل لديك رقم ملف طبي (MRN)؟", ["تخطي", "إدخال MRN"])
-            db.commit()
+        if _abort_if_hold_timed_out(phone, db, conversation, sess):
             return {**state, "handled": True}
+        lang = _lang(conversation, sess)
 
-        if sess.get("awaiting") == "mrn_optional":
-            if choice in {"إدخال MRN", "Enter MRN"} or text in {"إدخال MRN", "Enter MRN"}:
-                sess["awaiting"] = "mrn_value"
-                _clear_options(phone)
-                wa.send_text(
-                    phone,
-                    "Please type your MRN:"
-                    if i18n.is_english(_lang(conversation))
-                    else "اكتب رقم الملف الطبي:",
+        if sess.get("awaiting") == "known_patient_confirm":
+            if choice in i18n.SAME_PATIENT_CHOICES or text in i18n.SAME_PATIENT_CHOICES:
+                stored = patient_service.normalize_person_name(
+                    sess.get("known_patient_name") or ""
                 )
+                if patient_service.is_triple_name(stored):
+                    sess["patient_name"] = stored
+                    if _advance_after_patient_name(phone, sess, lang=lang):
+                        db.commit()
+                        return {**state, "handled": True}
+                    # awaiting=summary → fall through below
+                else:
+                    sess["awaiting"] = "patient_name"
+                    _clear_options(phone)
+                    wa.send_text(phone, i18n.complete_profile_name(lang))
+                    db.commit()
+                    return {**state, "handled": True}
+            elif choice in i18n.NAME_CHANGED_CHOICES or text in i18n.NAME_CHANGED_CHOICES:
+                sess["awaiting"] = "patient_name"
+                _clear_options(phone)
+                wa.send_text(phone, i18n.ask_patient_full_name(lang))
                 db.commit()
                 return {**state, "handled": True}
-            # skip
-            sess["awaiting"] = "dob_gate"
-        elif sess.get("awaiting") == "mrn_value":
-            sess["mrn"] = text.strip()
-            sess["awaiting"] = "dob_gate"
+            else:
+                _offer_buttons(
+                    phone,
+                    i18n.known_patient_prompt(
+                        lang, sess.get("known_patient_name") or ""
+                    ),
+                    i18n.known_patient_buttons(lang),
+                )
+                return {**state, "handled": True}
+
+        if sess.get("awaiting") == "patient_name":
+            cleaned = patient_service.normalize_person_name(text)
+            if not patient_service.is_triple_name(cleaned):
+                wa.send_text(phone, i18n.patient_name_too_short(lang))
+                return {**state, "handled": True}
+            sess["patient_name"] = cleaned
+            if _advance_after_patient_name(phone, sess, lang=lang):
+                db.commit()
+                return {**state, "handled": True}
+            # fall through to summary
 
         if sess.get("awaiting") == "dob_gate":
             if REQUIRE_DOB:
                 sess["awaiting"] = "dob_value"
                 _clear_options(phone)
-                wa.send_text(
-                    phone,
-                    "Please enter date of birth (YYYY-MM-DD):"
-                    if i18n.is_english(_lang(conversation))
-                    else "برجاء إدخال تاريخ الميلاد (YYYY-MM-DD):",
-                )
+                wa.send_text(phone, i18n.ask_dob(lang))
                 db.commit()
                 return {**state, "handled": True}
             sess["awaiting"] = "summary"
@@ -1096,12 +1428,7 @@ def node_handle(state: GraphState) -> GraphState:
             try:
                 datetime.strptime(raw, "%Y-%m-%d")
             except ValueError:
-                wa.send_text(
-                    phone,
-                    "Invalid date. Use YYYY-MM-DD."
-                    if i18n.is_english(_lang(conversation))
-                    else "صيغة غير صحيحة. استخدم YYYY-MM-DD.",
-                )
+                wa.send_text(phone, i18n.invalid_dob(lang))
                 return {**state, "handled": True}
             sess["dob"] = raw
             sess["awaiting"] = "summary"
@@ -1117,9 +1444,10 @@ def node_handle(state: GraphState) -> GraphState:
                 .filter(AppointmentSlot.slot_id == sess["slot_id"])
                 .one()
             )
-            lang = _lang(conversation)
             fields = i18n.doctor_display_fields(doctor, lang)
-            loc = i18n.clinic_location(lang)
+            loc = clinic_settings_service.format_clinic_location_display(
+                db, DEFAULT_CLINIC_ID, lang
+            )
             dups = booking_service.find_duplicate_appointments(
                 db,
                 clinic_id=DEFAULT_CLINIC_ID,
@@ -1130,55 +1458,32 @@ def node_handle(state: GraphState) -> GraphState:
             if dups and not sess.get("duplicate_ack"):
                 ref = dups[0].get("appointment_ref") or ""
                 when = _format_date(dups[0]["slot_start"], lang)
-                if i18n.is_english(lang):
-                    dup_note = (
-                        f"\n⚠️ You already have an appointment with this doctor soon "
-                        f"({ref} on {when}). Continue only if intentional.\n"
-                    )
-                else:
-                    dup_note = (
-                        f"\n⚠️ لديك بالفعل موعد قريب مع نفس الطبيب "
-                        f"({ref} بتاريخ {when}). تابع فقط إذا كان مقصوداً.\n"
-                    )
+                dup_note = i18n.duplicate_appointment_note(lang, ref=ref, when=when)
                 sess["duplicate_ack"] = True
-            if i18n.is_english(lang):
-                summary = (
-                    "Booking summary:\n"
-                    f"- Name: {sess.get('patient_name')}\n"
-                    f"- Phone: {phone}\n"
-                    f"- Doctor: {fields['name']}\n"
-                    f"- Specialty: {fields['specialization'] or ''}\n"
-                    f"- Date: {_format_date(slot_row.slot_start, lang)}\n"
-                    f"- Time: {_format_time(slot_row.slot_start, lang)}\n"
-                    f"- Location: {loc}\n"
-                    f"{dup_note}\n"
-                    "Confirm this booking?"
-                )
-                buttons = ["Confirm", "Cancel"]
-            else:
-                summary = (
-                    "ملخص الحجز:\n"
-                    f"- الاسم: {sess.get('patient_name')}\n"
-                    f"- الهاتف: {phone}\n"
-                    f"- الطبيب: {fields['name']}\n"
-                    f"- التخصص: {fields['specialization'] or ''}\n"
-                    f"- التاريخ: {_format_date(slot_row.slot_start, lang)}\n"
-                    f"- الوقت: {_format_time(slot_row.slot_start, lang)}\n"
-                    f"- المكان: {loc}\n"
-                    f"{dup_note}\n"
-                    "هل تريد تأكيد الحجز؟"
-                )
-                buttons = ["تأكيد", "إلغاء"]
+            summary = i18n.booking_summary(
+                lang,
+                patient_name=sess.get("patient_name"),
+                phone=phone,
+                doctor_name=fields["name"],
+                specialization=fields["specialization"],
+                date_label=_format_date(slot_row.slot_start, lang),
+                time_label=_format_time(slot_row.slot_start, lang),
+                location=loc,
+                dup_note=dup_note,
+            )
             set_conversation_state(
                 db, conversation, ConversationState.CONFIRMING, current_intent="confirming"
             )
-            _offer_buttons(phone, summary, buttons)
+            _offer_buttons(phone, summary, i18n.confirm_buttons(lang))
             db.commit()
             return {**state, "handled": True}
 
     # ---- Confirm ----
     if conv_state == ConversationState.CONFIRMING.value:
-        if choice in {"إلغاء", "Cancel"} or text in {"إلغاء", "Cancel", "لا", "no", "No"}:
+        if _abort_if_hold_timed_out(phone, db, conversation, sess):
+            return {**state, "handled": True}
+        lang = _lang(conversation)
+        if choice in i18n.CANCEL_ABORT_CHOICES or text in i18n.CANCEL_ABORT_CHOICES:
             slot_row = (
                 db.query(AppointmentSlot)
                 .filter(AppointmentSlot.slot_id == sess.get("slot_id"))
@@ -1190,16 +1495,11 @@ def node_handle(state: GraphState) -> GraphState:
                 slot_row.updated_by = "user_abort_hold"
                 db.commit()
             _clear_draft(phone)
-            cancel_msg = (
-                "Booking cancelled."
-                if i18n.is_english(_lang(conversation))
-                else "تم إلغاء عملية الحجز."
-            )
-            wa.send_text(phone, cancel_msg)
-            _send_main_menu(phone, db, conversation)
+            wa.send_text(phone, i18n.booking_process_cancelled(lang))
+            _finish_flow_quietly(phone, db, conversation)
             return {**state, "handled": True}
 
-        if choice in {"تأكيد", "Confirm"} or text in {"تأكيد", "Confirm", "نعم", "yes", "Yes"}:
+        if choice in i18n.CONFIRM_CHOICES or text in i18n.CONFIRM_CHOICES:
             if _sess_missing(phone, db, conversation, "doctor_id", "slot_id"):
                 return {**state, "handled": True}
             try:
@@ -1211,16 +1511,17 @@ def node_handle(state: GraphState) -> GraphState:
                     patient_name=sess.get("patient_name"),
                     doctor_id=sess["doctor_id"],
                     slot_id=sess["slot_id"],
-                    mrn=sess.get("mrn"),
                     dob=sess.get("dob"),
                 )
             except BookingError as exc:
-                wa.send_text(phone, f"تعذر تأكيد الحجز: {exc}")
-                _send_main_menu(phone, db, conversation)
+                if _is_hold_timeout_error(exc):
+                    _notify_booking_hold_timeout(phone, db, conversation)
+                else:
+                    wa.send_text(phone, i18n.booking_error(lang, str(exc)))
+                    _finish_flow_quietly(phone, db, conversation)
                 return {**state, "handled": True}
 
             start = datetime.fromisoformat(result["slot_start"])
-            lang = _lang(conversation)
             doctor_name = (
                 result.get("doctor_name_en") or result.get("doctor_name_ar")
                 if i18n.is_english(lang)
@@ -1233,6 +1534,9 @@ def node_handle(state: GraphState) -> GraphState:
                 specialization=result.get("specialization"),
                 date_label=_format_date(start, lang),
                 time_label=_format_time(start, lang),
+                location=clinic_settings_service.format_clinic_location_display(
+                    db, DEFAULT_CLINIC_ID, lang
+                ),
             )
             wa.send_text(phone, msg)
             log_message(
@@ -1244,40 +1548,55 @@ def node_handle(state: GraphState) -> GraphState:
                 status="sent",
             )
             db.commit()
-            _clear_draft(phone)
+            _finish_flow_quietly(phone, db, conversation)
             return {**state, "handled": True}
 
-        _offer_buttons(phone, "لتأكيد الحجز اضغط تأكيد أو إلغاء.", ["تأكيد", "إلغاء"])
+        _offer_buttons(
+            phone, i18n.confirm_booking_hint(lang), i18n.confirm_buttons(lang)
+        )
         return {**state, "handled": True}
 
     # ---- Reschedule (UC-003) ----
     if conv_state == ConversationState.RESCHEDULE.value:
         awaiting = sess.get("awaiting")
+        lang = _lang(conversation)
+
+        # After uvicorn reload the in-memory draft is empty while DB state stays
+        # RESCHEDULE — recover instead of re-sending the pick list.
+        if not awaiting:
+            if (choice or "").startswith("appt_") or (
+                text and sess.get("upcoming")
+            ):
+                awaiting = "pick_appointment"
+                sess["awaiting"] = "pick_appointment"
+            elif sess.get("appointment_id") and sess.get("current_appt"):
+                awaiting = "change_type"
+                sess["awaiting"] = "change_type"
 
         if awaiting == "pick_appointment":
-            appt_id = None
-            info = None
-            if choice.startswith("appt_"):
-                appt_id = int(choice.replace("appt_", ""))
-                info = (sess.get("upcoming") or {}).get(str(appt_id))
-            elif text:
-                found = booking_service.find_appointment_by_ref(
-                    db,
-                    clinic_id=DEFAULT_CLINIC_ID,
-                    whatsapp_phone=phone,
-                    appointment_ref=text,
-                )
-                if found:
-                    appt_id = found["appointment_id"]
-                    info = {
-                        "doctor_id": found["doctor_id"],
-                        "doctor_name": found.get("doctor_name"),
-                        "slot_start": found["slot_start"].isoformat(sep=" ", timespec="minutes"),
-                        "appointment_ref": found.get("appointment_ref"),
-                        "specialization": found.get("specialization"),
-                    }
+            appt_id, info = _resolve_upcoming_pick(
+                db, phone, sess, choice=choice, text=text
+            )
             if not info or appt_id is None:
-                wa.send_text(phone, "اختر الموعد من القائمة أو اكتب رقم الموعد.")
+                # Don't restart the whole flow (feels like a duplicate list).
+                wa.send_text(phone, i18n.pick_appointment_or_ref(lang))
+                # Re-offer the same list once so the user can tap again.
+                upcoming_rows = booking_service.list_upcoming_appointments_for_phone(
+                    db, clinic_id=DEFAULT_CLINIC_ID, whatsapp_phone=phone
+                )
+                if upcoming_rows:
+                    sess["upcoming"] = {
+                        str(a["appointment_id"]): _appt_session_info(a, lang)
+                        for a in upcoming_rows
+                    }
+                    _offer_list(
+                        phone,
+                        body=i18n.pick_appointment_to_reschedule(lang),
+                        button_label=i18n.your_appointments_label(lang),
+                        rows=[_appt_list_row(a, lang) for a in upcoming_rows[:10]],
+                        section_title=i18n.appointments_section(lang),
+                    )
+                db.commit()
                 return {**state, "handled": True}
 
             start = datetime.fromisoformat(info["slot_start"])
@@ -1298,17 +1617,26 @@ def node_handle(state: GraphState) -> GraphState:
             sess["doctor_id"] = int(info["doctor_id"])
             sess["current_appt"] = info
             sess["awaiting"] = "change_type"
-            _offer_reschedule_change_type(phone, sess)
+            _offer_reschedule_change_type(phone, sess, lang=lang)
             db.commit()
             return {**state, "handled": True}
 
         if awaiting == "change_type":
-            if choice in {"رجوع"} or text in {"رجوع", "لا"}:
+            if (
+                choice in i18n.RESCHEDULE_BACK
+                or text in i18n.RESCHEDULE_BACK
+                or text in {"لا", "No", "no"}
+            ):
                 _clear_draft(phone)
-                wa.send_text(phone, "تم الإبقاء على الموعد الحالي بدون تعديل.")
-                _send_main_menu(phone, db, conversation)
+                wa.send_text(phone, i18n.keep_appointment_unchanged(lang))
+                _finish_flow_quietly(phone, db, conversation)
                 return {**state, "handled": True}
-            if choice in {"تغيير الطبيب"} or text == "تغيير الطبيب":
+
+            # 1) Change doctor → doctor + day + time
+            if (
+                choice in i18n.RESCHEDULE_CHANGE_DOCTOR
+                or text in i18n.RESCHEDULE_CHANGE_DOCTOR
+            ):
                 sess["flow"] = "reschedule_doctor"
                 sess.pop("doctor_id", None)
                 sess["awaiting"] = None
@@ -1318,33 +1646,41 @@ def node_handle(state: GraphState) -> GraphState:
                     ConversationState.BOOKING_DOCTOR,
                     current_intent="reschedule_doctor",
                 )
-                _offer_buttons(phone, "اختر الطبيب الجديد:", i18n.booking_path_buttons(_lang(conversation)))
+                _offer_buttons(
+                    phone,
+                    i18n.choose_new_doctor(lang),
+                    i18n.booking_path_buttons(lang),
+                )
                 db.commit()
                 return {**state, "handled": True}
-            # default: change time, same doctor
-            sess["flow"] = "reschedule_time"
-            sess["awaiting"] = "date"
-            booking_service.release_expired_holds(db, clinic_id=DEFAULT_CLINIC_ID)
-            avail = booking_service.get_available_dates_and_slots(
-                db, doctor_id=sess["doctor_id"], clinic_id=DEFAULT_CLINIC_ID
-            )
-            dates = list(avail.get("dates", {}).keys())
-            if not dates:
-                wa.send_text(phone, "لا توجد مواعيد بديلة. بقي موعدك الحالي كما هو.")
-                _clear_draft(phone)
-                _send_main_menu(phone, db, conversation)
+
+            # 2) Change day → same doctor, new day + time
+            if (
+                choice in i18n.RESCHEDULE_CHANGE_DAY
+                or text in i18n.RESCHEDULE_CHANGE_DAY
+            ):
+                sess["flow"] = "reschedule_day"
+                if not _offer_reschedule_day_picker(phone, db, sess, lang):
+                    _finish_flow_quietly(phone, db, conversation)
+                    return {**state, "handled": True}
+                db.commit()
                 return {**state, "handled": True}
-            _offer_list(
-                phone,
-                body=(
-                    "Choose the new appointment day:"
-                    if i18n.is_english(_lang(conversation))
-                    else "اختر اليوم الجديد للموعد:"
-                ),
-                button_label="Days" if i18n.is_english(_lang(conversation)) else "الأيام",
-                rows=_date_list_rows(dates, _lang(conversation)),
-                section_title="Dates" if i18n.is_english(_lang(conversation)) else "التواريخ",
-            )
+
+            # 3) Change time → same doctor + same day, new time only
+            if (
+                choice in i18n.RESCHEDULE_CHANGE_TIME
+                or text in i18n.RESCHEDULE_CHANGE_TIME
+            ):
+                sess["flow"] = "reschedule_time"
+                if not _offer_reschedule_same_day_slots(phone, db, sess, lang):
+                    if not _offer_reschedule_day_picker(phone, db, sess, lang):
+                        _finish_flow_quietly(phone, db, conversation)
+                        return {**state, "handled": True}
+                    sess["flow"] = "reschedule_day"
+                db.commit()
+                return {**state, "handled": True}
+
+            _offer_reschedule_change_type(phone, sess, lang=lang)
             db.commit()
             return {**state, "handled": True}
 
@@ -1354,34 +1690,31 @@ def node_handle(state: GraphState) -> GraphState:
             avail = booking_service.get_available_dates_and_slots(
                 db, doctor_id=sess["doctor_id"], clinic_id=DEFAULT_CLINIC_ID
             )
-            day_slots = avail.get("dates", {}).get(selected_date) or []
+            day_slots = _filter_bookable_slots(
+                avail.get("dates", {}).get(selected_date) or []
+            )
             if not day_slots:
-                wa.send_text(phone, "لا توجد أوقات في هذا اليوم. اختر يوماً آخر.")
+                wa.send_text(phone, i18n.no_slots_on_day(lang))
                 return {**state, "handled": True}
             sess["awaiting"] = "slot"
-            lang = _lang(conversation)
             date_label = _date_option_title(selected_date, lang)
             _offer_list(
                 phone,
-                body=(
-                    f"Choose the new time on {date_label}:"
-                    if i18n.is_english(lang)
-                    else f"اختر الوقت الجديد بتاريخ {date_label}:"
-                ),
-                button_label="Times" if i18n.is_english(lang) else "الأوقات",
+                body=i18n.choose_new_time_on_date(lang, date_label),
+                button_label=i18n.times_button_label(lang),
                 rows=_slot_list_rows(day_slots, lang),
-                section_title="Slots" if i18n.is_english(lang) else "المواعيد",
+                section_title=i18n.slots_section_title(lang),
             )
             db.commit()
             return {**state, "handled": True}
 
         if awaiting == "slot":
             if not choice.startswith("slot_"):
-                wa.send_text(phone, "اختر الوقت من القائمة.")
+                wa.send_text(phone, i18n.choose_time_from_list(lang))
                 return {**state, "handled": True}
             slot_id = int(choice.replace("slot_", ""))
             try:
-                booking_service.hold_slot(
+                hold_result = booking_service.hold_slot(
                     db,
                     slot_id=slot_id,
                     clinic_id=DEFAULT_CLINIC_ID,
@@ -1389,9 +1722,10 @@ def node_handle(state: GraphState) -> GraphState:
                     hold_minutes=SLOT_HOLD_MINUTES,
                 )
             except BookingError as exc:
-                wa.send_text(phone, f"تعذر حجز الوقت مؤقتاً: {exc}")
+                wa.send_text(phone, i18n.hold_error(lang, str(exc)))
                 return {**state, "handled": True}
             sess["slot_id"] = slot_id
+            _store_hold_deadline(sess, hold_result)
             sess["awaiting"] = "confirm"
             doctor = doctor_service.get_doctor(
                 db, sess["doctor_id"], clinic_id=DEFAULT_CLINIC_ID
@@ -1402,40 +1736,26 @@ def node_handle(state: GraphState) -> GraphState:
                 .one()
             )
             old = sess.get("current_appt") or {}
-            old_start = datetime.fromisoformat(old["slot_start"]) if old.get("slot_start") else None
-            lang = _lang(conversation)
             fields = i18n.doctor_display_fields(doctor, lang) if doctor else {"name": ""}
-            loc = i18n.clinic_location(lang)
-            old_date = _format_date(old_start, lang) if old_start else "-"
-            new_date = _format_date(slot_row.slot_start, lang)
-            old_time = _format_time(old_start, lang) if old_start else "-"
-            new_time = _format_time(slot_row.slot_start, lang)
-            if i18n.is_english(lang):
-                summary = (
-                    "Appointment comparison (old → new):\n"
-                    f"- Doctor: {old.get('doctor_name') or ''} → {fields['name']}\n"
-                    f"- Date: {old_date} → {new_date}\n"
-                    f"- Time: {old_time} → {new_time}\n"
-                    f"- Location: {loc}\n\n"
-                    "Confirm this change?"
-                )
-                buttons = ["Confirm", "Cancel"]
-            else:
-                summary = (
-                    "مقارنة الموعد (القديم ← الجديد):\n"
-                    f"- الطبيب: {old.get('doctor_name') or ''} ← {fields['name']}\n"
-                    f"- التاريخ: {old_date} ← {new_date}\n"
-                    f"- الوقت: {old_time} ← {new_time}\n"
-                    f"- المكان: {loc}\n\n"
-                    "هل تريد تأكيد التعديل؟"
-                )
-                buttons = ["تأكيد", "إلغاء"]
-            _offer_buttons(phone, summary, buttons)
+            loc = clinic_settings_service.format_clinic_location_display(
+                db, DEFAULT_CLINIC_ID, lang
+            )
+            summary = i18n.reschedule_summary(
+                lang,
+                appointment_ref=old.get("appointment_ref"),
+                doctor_name=fields.get("name") or old.get("doctor_name"),
+                date_label=_format_date(slot_row.slot_start, lang),
+                time_label=_format_time(slot_row.slot_start, lang),
+                location=loc,
+            )
+            _offer_buttons(phone, summary, i18n.confirm_buttons(lang))
             db.commit()
             return {**state, "handled": True}
 
         if awaiting == "confirm":
-            if choice in {"إلغاء", "Cancel"} or text in {"إلغاء", "Cancel", "لا", "no", "No"}:
+            if _abort_if_hold_timed_out(phone, db, conversation, sess, reschedule=True):
+                return {**state, "handled": True}
+            if choice in i18n.CANCEL_ABORT_CHOICES or text in i18n.CANCEL_ABORT_CHOICES:
                 slot_row = (
                     db.query(AppointmentSlot)
                     .filter(AppointmentSlot.slot_id == sess.get("slot_id"))
@@ -1446,11 +1766,11 @@ def node_handle(state: GraphState) -> GraphState:
                     slot_row.hold_expires_at = None
                     db.commit()
                 _clear_draft(phone)
-                wa.send_text(phone, "تم إلغاء عملية التعديل. موعدك القديم كما هو.")
-                _send_main_menu(phone, db, conversation)
+                wa.send_text(phone, i18n.reschedule_process_cancelled(lang))
+                _finish_flow_quietly(phone, db, conversation)
                 return {**state, "handled": True}
 
-            if choice in {"تأكيد", "Confirm"} or text in {"تأكيد", "Confirm", "نعم", "yes", "Yes"}:
+            if choice in i18n.CONFIRM_CHOICES or text in i18n.CONFIRM_CHOICES:
                 try:
                     result = booking_service.reschedule_appointment(
                         db,
@@ -1460,13 +1780,16 @@ def node_handle(state: GraphState) -> GraphState:
                         new_slot_id=sess["slot_id"],
                     )
                 except BookingError as exc:
-                    wa.send_text(phone, f"تعذر تعديل الموعد: {exc}")
-                    _clear_draft(phone)
-                    _send_main_menu(phone, db, conversation)
+                    if _is_hold_timeout_error(exc):
+                        _notify_booking_hold_timeout(
+                            phone, db, conversation, reschedule=True
+                        )
+                    else:
+                        wa.send_text(phone, i18n.reschedule_error(lang, str(exc)))
+                        _finish_flow_quietly(phone, db, conversation)
                     return {**state, "handled": True}
 
                 start = datetime.fromisoformat(result["slot_start"])
-                lang = _lang(conversation)
                 doctor_name = (
                     result.get("doctor_name_en") or result.get("doctor_name_ar")
                     if i18n.is_english(lang)
@@ -1479,45 +1802,50 @@ def node_handle(state: GraphState) -> GraphState:
                     specialization=result.get("specialization"),
                     date_label=_format_date(start, lang),
                     time_label=_format_time(start, lang),
+                    location=clinic_settings_service.format_clinic_location_display(
+                        db, DEFAULT_CLINIC_ID, lang
+                    ),
                 )
                 wa.send_text(phone, msg)
-                _clear_draft(phone)
-                _send_main_menu(phone, db, conversation)
+                _finish_flow_quietly(phone, db, conversation)
                 return {**state, "handled": True}
 
-            _offer_buttons(phone, "لتأكيد التعديل اضغط تأكيد أو إلغاء.", ["تأكيد", "إلغاء"])
+            _offer_buttons(
+                phone, i18n.confirm_reschedule_hint(lang), i18n.confirm_buttons(lang)
+            )
             return {**state, "handled": True}
 
+        # Draft lost and nothing to recover — start clean once.
         _start_reschedule_flow(phone, db, conversation)
         return {**state, "handled": True}
 
     # ---- Cancel (UC-002) ----
     if conv_state == ConversationState.CANCEL.value:
         awaiting = sess.get("awaiting")
+        lang = _lang(conversation)
 
         if awaiting == "pick_appointment":
-            appt_id = None
-            info = None
-            if choice.startswith("appt_"):
-                appt_id = int(choice.replace("appt_", ""))
-                info = (sess.get("upcoming") or {}).get(str(appt_id))
-            elif text:
-                found = booking_service.find_appointment_by_ref(
-                    db,
-                    clinic_id=DEFAULT_CLINIC_ID,
-                    whatsapp_phone=phone,
-                    appointment_ref=text,
-                )
-                if found:
-                    appt_id = found["appointment_id"]
-                    info = {
-                        "doctor_id": found["doctor_id"],
-                        "doctor_name": found.get("doctor_name"),
-                        "slot_start": found["slot_start"].isoformat(sep=" ", timespec="minutes"),
-                        "appointment_ref": found.get("appointment_ref"),
-                    }
+            appt_id, info = _resolve_upcoming_pick(
+                db, phone, sess, choice=choice, text=text
+            )
             if not info or appt_id is None:
-                wa.send_text(phone, "اختر الموعد من القائمة أو اكتب رقم الموعد.")
+                wa.send_text(phone, i18n.pick_appointment_or_ref(lang))
+                upcoming_rows = booking_service.list_upcoming_appointments_for_phone(
+                    db, clinic_id=DEFAULT_CLINIC_ID, whatsapp_phone=phone
+                )
+                if upcoming_rows:
+                    sess["upcoming"] = {
+                        str(a["appointment_id"]): _appt_session_info(a, lang)
+                        for a in upcoming_rows
+                    }
+                    _offer_list(
+                        phone,
+                        body=i18n.pick_appointment_to_cancel(lang),
+                        button_label=i18n.your_appointments_label(lang),
+                        rows=[_appt_list_row(a, lang) for a in upcoming_rows[:10]],
+                        section_title=i18n.appointments_section(lang),
+                    )
+                db.commit()
                 return {**state, "handled": True}
 
             start = datetime.fromisoformat(info["slot_start"])
@@ -1538,59 +1866,28 @@ def node_handle(state: GraphState) -> GraphState:
             sess["appointment_id"] = appt_id
             sess["current_appt"] = info
             sess["awaiting"] = "confirm"
-            lang = _lang(conversation)
-            summary = (
-                (
-                    "Confirm cancellation:\n"
-                    f"- Ref: {info.get('appointment_ref') or appt_id}\n"
-                    f"- Doctor: {info.get('doctor_name') or ''}\n"
-                    f"- Date: {_format_date(start, lang)}\n"
-                    f"- Time: {_format_time(start, lang)}\n\n"
-                    "Confirm cancel?"
-                )
-                if i18n.is_english(lang)
-                else (
-                    "تأكيد إلغاء الموعد:\n"
-                    f"- رقم الموعد: {info.get('appointment_ref') or appt_id}\n"
-                    f"- الطبيب: {info.get('doctor_name') or ''}\n"
-                    f"- التاريخ: {_format_date(start, lang)}\n"
-                    f"- الوقت: {_format_time(start, lang)}\n\n"
-                    "هل تريد تأكيد الإلغاء؟"
-                )
+            summary = i18n.cancel_summary(
+                lang,
+                appointment_ref=str(info.get("appointment_ref") or appt_id),
+                doctor_name=info.get("doctor_name"),
+                date_label=_format_date(start, lang),
+                time_label=_format_time(start, lang),
             )
-            buttons = (
-                ["Confirm cancel", "Back"]
-                if i18n.is_english(lang)
-                else ["تأكيد الإلغاء", "رجوع"]
-            )
-            _offer_buttons(phone, summary, buttons)
+            _offer_buttons(phone, summary, i18n.cancel_confirm_buttons(lang))
             db.commit()
             return {**state, "handled": True}
 
         if awaiting == "confirm":
-            if choice in {"رجوع", "Back", "Cancel"} or text in {
-                "رجوع",
-                "Back",
-                "لا",
-                "إلغاء",
-                "Cancel",
-                "no",
-                "No",
-            }:
+            if choice in i18n.BACK_CHOICES or text in i18n.BACK_CHOICES:
                 _clear_draft(phone)
-                wa.send_text(phone, "تم إبقاء الموعد بدون إلغاء.")
-                _send_main_menu(phone, db, conversation)
+                wa.send_text(phone, i18n.keep_appointment_no_cancel(lang))
+                _finish_flow_quietly(phone, db, conversation)
                 return {**state, "handled": True}
 
-            if choice in {"تأكيد الإلغاء", "Confirm cancel", "Confirm"} or text in {
-                "تأكيد الإلغاء",
-                "Confirm cancel",
-                "تأكيد",
-                "نعم",
-                "Confirm",
-                "Yes",
-                "yes",
-            }:
+            if (
+                choice in i18n.CONFIRM_CANCEL_CHOICES
+                or text in i18n.CONFIRM_CANCEL_CHOICES
+            ):
                 try:
                     result = booking_service.cancel_appointment(
                         db,
@@ -1600,9 +1897,8 @@ def node_handle(state: GraphState) -> GraphState:
                         reason="Cancelled via WhatsApp by patient",
                     )
                 except BookingError as exc:
-                    wa.send_text(phone, f"تعذر إلغاء الموعد: {exc}")
-                    _clear_draft(phone)
-                    _send_main_menu(phone, db, conversation)
+                    wa.send_text(phone, i18n.cancel_error(lang, str(exc)))
+                    _finish_flow_quietly(phone, db, conversation)
                     return {**state, "handled": True}
 
                 start = (
@@ -1610,7 +1906,6 @@ def node_handle(state: GraphState) -> GraphState:
                     if result.get("slot_start")
                     else None
                 )
-                lang = _lang(conversation)
                 doctor_name = (
                     result.get("doctor_name_en") or result.get("doctor_name_ar") or ""
                     if i18n.is_english(lang)
@@ -1624,13 +1919,8 @@ def node_handle(state: GraphState) -> GraphState:
                     date_label=_format_date(start, lang) if start else "-",
                     time_label=_format_time(start, lang) if start else "-",
                 )
-                post_btns = (
-                    ["Book again", "Menu"]
-                    if i18n.is_english(lang)
-                    else ["حجز موعد جديد", "القائمة"]
-                )
-                _offer_buttons(phone, msg, post_btns)
-                sess.clear()
+                _offer_buttons(phone, msg, i18n.post_cancel_buttons(lang))
+                _sess_clear_keep_lang(sess)
                 sess["awaiting"] = "post_cancel"
                 set_conversation_state(
                     db, conversation, ConversationState.MAIN_MENU, current_intent="cancelled"
@@ -1638,17 +1928,20 @@ def node_handle(state: GraphState) -> GraphState:
                 db.commit()
                 return {**state, "handled": True}
 
-            _offer_buttons(phone, "أكد الإلغاء أو ارجع للقائمة.", ["تأكيد الإلغاء", "رجوع"])
+            _offer_buttons(
+                phone, i18n.confirm_cancel_hint(lang), i18n.cancel_confirm_buttons(lang)
+            )
             return {**state, "handled": True}
 
         _start_cancel_flow(phone, db, conversation)
         return {**state, "handled": True}
 
     if conv_state == ConversationState.HANDOVER.value:
-        wa.send_text(phone, "طلبك مسجّل لدى الاستقبال. اكتب MENU للعودة للقائمة.")
+        wa.send_text(phone, i18n.handover_already_open(_lang(conversation)))
         return {**state, "handled": True}
-
-    _send_main_menu(phone, db, conversation)
+    # Unknown mid-flow state: nudge without dumping the full welcome menu.
+    wa.send_text(phone, i18n.type_menu_hint(_lang(conversation)))
+    _finish_flow_quietly(phone, db, conversation)
     return {**state, "handled": True}
 
 

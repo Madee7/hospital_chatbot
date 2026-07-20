@@ -15,6 +15,7 @@ from app.models.conversation_models import Conversation
 from app.models.patient_models import Patient
 from app.models.reminder_models import Reminder
 from app.services import whatsapp_client as wa
+from app.services.clinic_settings_service import format_clinic_location_display
 from app.services.doctor_service import get_doctor
 
 
@@ -181,7 +182,6 @@ def process_due_reminders(
             continue
 
         doctor = get_doctor(db, appointment.doctor_id, clinic_id=appointment.clinic_id)
-        doctor_name = (doctor.name_ar or doctor.name_en) if doctor else f"#{appointment.doctor_id}"
         lang = "ar"
         prev_conv = (
             db.query(Conversation)
@@ -194,8 +194,11 @@ def process_due_reminders(
         )
         if prev_conv and prev_conv.language is not None:
             lang = i18n.normalize_lang(prev_conv.language)
-        if i18n.is_english(lang):
-            doctor_name = (doctor.name_en or doctor.name_ar) if doctor else doctor_name
+        doctor_name = (
+            i18n.doctor_display_name(doctor, lang)
+            if doctor
+            else f"#{appointment.doctor_id}"
+        )
         body = i18n.reminder(
             lang,
             appointment_ref=appointment.appointment_ref or str(appointment.appointment_id),
@@ -203,7 +206,7 @@ def process_due_reminders(
             date_label=slot.slot_start.strftime("%Y-%m-%d"),
             time_label=format_time_12h(slot.slot_start, lang),
             hours_label=_hours_label(reminder.reminder_type),
-            location=None,
+            location=format_clinic_location_display(db, appointment.clinic_id, lang),
         )
 
         if dry_run:

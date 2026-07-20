@@ -23,7 +23,7 @@ from app.services.conversation_service import (
 )
 from app.services.doctor_service import get_doctor
 from app.services.helpers import generate_appointment_ref
-from app.services.patient_service import get_or_create_patient
+from app.services.patient_service import get_or_create_patient, normalize_person_name
 from app.services.slot_service import (
     earliest_bookable_at,
     ensure_slots_for_doctor,
@@ -175,7 +175,6 @@ def confirm_booking(
     doctor_id: int,
     slot_id: int,
     reason: str | None = None,
-    mrn: str | None = None,
     dob: str | None = None,
     created_channel: str = "whatsapp",
     created_by: str = "bot",
@@ -203,16 +202,12 @@ def confirm_booking(
         clinic_id=clinic_id,
         whatsapp_phone=whatsapp_phone,
         name=patient_name,
-        mrn=mrn,
         dob=dob,
         created_by=created_by,
     )
 
     if patient_name:
-        patient.name = patient_name
-        patient.updated_by = created_by
-    if mrn:
-        patient.mrn = mrn
+        patient.name = normalize_person_name(patient_name)
         patient.updated_by = created_by
     if dob:
         patient.dob = dob
@@ -390,13 +385,17 @@ def list_upcoming_appointments_for_phone(
     result: list[dict] = []
     for appt, slot in rows:
         doctor = get_doctor(db, appt.doctor_id, clinic_id=clinic_id)
-        name = (doctor.name_ar or doctor.name_en) if doctor else f"Doctor {appt.doctor_id}"
+        name_ar = (doctor.name_ar if doctor else None) or None
+        name_en = (doctor.name_en if doctor else None) or None
         result.append(
             {
                 "appointment_id": appt.appointment_id,
                 "appointment_ref": appt.appointment_ref,
                 "doctor_id": appt.doctor_id,
-                "doctor_name": name,
+                "name_ar": name_ar,
+                "name_en": name_en,
+                # Default Arabic for legacy callers; UI should localize via lang.
+                "doctor_name": name_ar or name_en or f"Doctor {appt.doctor_id}",
                 "specialization": doctor.specialization if doctor else None,
                 "slot_id": slot.slot_id,
                 "slot_start": slot.slot_start,
@@ -674,6 +673,70 @@ def find_appointment_by_ref(
         # allow partial match on last chars (WA list titles truncate)
         if a.get("appointment_ref") and ref.lower() in a["appointment_ref"].lower():
             return a
+    return None
+
+
+def find_upcoming_appointment_choice(
+    db: Session,
+    *,
+    clinic_id: int,
+    whatsapp_phone: str,
+    choice: str | None = None,
+    text: str | None = None,
+    cached: dict[str, dict] | None = None,
+) -> dict | None:
+    """Resolve a WhatsApp list pick (appt_id / ref / doctor name) to an upcoming appt.
+
+    Prefers ``cached`` session map when present, then falls back to DB so picks
+    still work after an in-memory session reload.
+    """
+    upcoming_rows = list_upcoming_appointments_for_phone(
+        db, clinic_id=clinic_id, whatsapp_phone=whatsapp_phone, limit=20
+    )
+    by_id: dict[str, dict] = {
+        str(a["appointment_id"]): a for a in upcoming_rows
+    }
+    if cached:
+        for key, val in cached.items():
+            by_id.setdefault(str(key), val)
+
+    raw_choice = (choice or "").strip()
+    raw_text = (text or "").strip()
+
+    if raw_choice.startswith("appt_"):
+        appt_id = raw_choice.replace("appt_", "", 1).strip()
+        hit = by_id.get(appt_id)
+        if hit:
+            return hit
+
+    sample = raw_text or raw_choice
+    if not sample:
+        return None
+
+    by_ref = find_appointment_by_ref(
+        db,
+        clinic_id=clinic_id,
+        whatsapp_phone=whatsapp_phone,
+        appointment_ref=sample,
+    )
+    if by_ref:
+        return by_ref
+
+    # List title is often just the doctor name after our UI change.
+    needle = sample.lower()
+    name_hits = []
+    for a in by_id.values():
+        if not needle:
+            continue
+        candidates = (
+            a.get("name_ar"),
+            a.get("name_en"),
+            a.get("doctor_name"),
+        )
+        if any(needle in str(n or "").lower() for n in candidates):
+            name_hits.append(a)
+    if len(name_hits) == 1:
+        return name_hits[0]
     return None
 
 

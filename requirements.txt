@@ -49,3 +49,4 @@ langchain-core>=0.3.0
 Pillow>=10.0.0
 streamlit>=1.32.0
 pandas>=2.0.0
+lingua-language-detector>=2.0.2

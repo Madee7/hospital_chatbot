@@ -269,6 +269,17 @@ def page_clinic(db, clinic_id: int) -> None:
         tz = st.text_input("Timezone", value=clinic.timezone or "Africa/Cairo")
         lang = st.selectbox("Default language", options=lang_options, index=lang_index)
         address = st.text_area("Location / address", value=clinic.address or "")
+        maps_url = st.text_input(
+            "Google Maps URL",
+            value=cfg.get("clinic_maps_url", ""),
+            help="Patients receive a shortened version of this link in booking messages.",
+        )
+        if maps_url.strip():
+            from app.services.clinic_settings_service import shorten_google_maps_url
+
+            st.caption(
+                f"Short link sent to patients: {shorten_google_maps_url(maps_url)}"
+            )
         logo = st.text_input("Logo URL (config)", value=cfg.get("clinic_logo_url", ""))
         hours = st.text_input(
             "Business hours (config)",
@@ -305,6 +316,13 @@ def page_clinic(db, clinic_id: int) -> None:
                 tenant_id=clinic.tenant_id,
                 key="business_hours",
                 value=hours,
+            )
+            admin.set_config(
+                db,
+                clinic_id=clinic_id,
+                tenant_id=clinic.tenant_id,
+                key="clinic_maps_url",
+                value=maps_url.strip(),
             )
             _after_save("clinic", "Clinic saved.", reset_edit=False)
 
@@ -420,7 +438,8 @@ def page_doctors(db, clinic_id: int) -> None:
         specialization = st.text_input(
             "Specialization", value=(current or {}).get("specialization") or ""
         )
-        bio = st.text_area("Bio", value=(current or {}).get("bio") or "")
+        bio = st.text_area("Bio (AR)", value=(current or {}).get("bio") or "")
+        bio_en = st.text_area("Bio (EN)", value=(current or {}).get("bio_en") or "")
         photo_url = st.text_input("Photo URL", value=(current or {}).get("photo_url") or "")
         dept = st.selectbox(
             "Department (required)",
@@ -444,6 +463,7 @@ def page_doctors(db, clinic_id: int) -> None:
                     title=title,
                     specialization=specialization,
                     bio=bio,
+                    bio_en=bio_en or None,
                     photo_url=photo_url or None,
                     department_id=dept,
                     active_flag=active,

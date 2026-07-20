@@ -13,6 +13,7 @@ from typing import Any
 from openai import OpenAI
 
 from app.core.config import OPENAI_API_KEY, OPENAI_MODEL
+from app.language.multilingual_prompt import build_system_prompt
 
 
 Option = dict[str, Any]  # id, title, description?
@@ -59,7 +60,12 @@ def resolve_choice_rules(user_text: str, options: list[Option]) -> str | None:
     return None
 
 
-def resolve_choice_llm(user_text: str, options: list[Option]) -> str | None:
+def resolve_choice_llm(
+    user_text: str,
+    options: list[Option],
+    *,
+    lang: str | None = None,
+) -> str | None:
     """Ask OpenAI which option id matches; return only that id or None."""
     if not OPENAI_API_KEY or not user_text.strip() or not options:
         return None
@@ -81,12 +87,8 @@ def resolve_choice_llm(user_text: str, options: list[Option]) -> str | None:
             messages=[
                 {
                     "role": "system",
-                    "content": (
-                        "You map a patient's short WhatsApp reply to ONE option from a fixed list. "
-                        "The user may type a number, Arabic/English words, a specialty, doctor name, "
-                        "date, time, or paraphrase of a button. "
-                        "Return JSON {\"option_id\": \"exact id from list\"} or {\"option_id\": null} "
-                        "if none match. Never invent ids. Never write a chatbot reply."
+                    "content": build_system_prompt(
+                        lang or "ar", purpose="choice_mapper"
                     ),
                 },
                 {
@@ -111,7 +113,12 @@ def resolve_choice_llm(user_text: str, options: list[Option]) -> str | None:
         return None
 
 
-def resolve_choice(user_text: str, options: list[Option] | None) -> str | None:
+def resolve_choice(
+    user_text: str,
+    options: list[Option] | None,
+    *,
+    lang: str | None = None,
+) -> str | None:
     """Rules first, then LLM. Returns option id or None."""
     options = options or []
     if not options:
@@ -119,4 +126,4 @@ def resolve_choice(user_text: str, options: list[Option] | None) -> str | None:
     hit = resolve_choice_rules(user_text, options)
     if hit:
         return hit
-    return resolve_choice_llm(user_text, options)
+    return resolve_choice_llm(user_text, options, lang=lang)

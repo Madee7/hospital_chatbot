@@ -31,12 +31,13 @@ DATABASE_URL = os.getenv(
 # Default clinic context for MVP single-clinic demo
 DEFAULT_TENANT_ID = int(os.getenv("DEFAULT_TENANT_ID", "1"))
 DEFAULT_CLINIC_ID = int(os.getenv("DEFAULT_CLINIC_ID", "1"))
-CLINIC_DISPLAY_NAME = os.getenv("CLINIC_DISPLAY_NAME", "مستشفى جامعة نيو جيزة")
-CLINIC_LOCATION = os.getenv("CLINIC_LOCATION", "New Giza University Hospital")
+CLINIC_DISPLAY_NAME = os.getenv("CLINIC_DISPLAY_NAME", "دار الشفاء")
+CLINIC_LOCATION = os.getenv("CLINIC_LOCATION", "Dar Al Shfaa")
 CLINIC_LOCATION_AR = os.getenv(
     "CLINIC_LOCATION_AR",
-    os.getenv("CLINIC_DISPLAY_NAME", "مستشفى جامعة نيو جيزة"),
+    os.getenv("CLINIC_DISPLAY_NAME", "دار الشفاء"),
 )
+CLINIC_MAPS_URL = os.getenv("CLINIC_MAPS_URL", "").strip()
 
 # Ops / escalation
 RECEPTIONIST_WHATSAPP = os.getenv("RECEPTIONIST_WHATSAPP", "").strip()
@@ -49,7 +50,6 @@ BOOKING_WINDOW_DAYS = int(os.getenv("BOOKING_WINDOW_DAYS", "14"))
 MIN_LEAD_HOURS = int(os.getenv("MIN_LEAD_HOURS", "2"))
 DUPLICATE_APPOINTMENT_DAYS = int(os.getenv("DUPLICATE_APPOINTMENT_DAYS", "7"))
 ALLOW_OVERBOOKING = os.getenv("ALLOW_OVERBOOKING", "false").lower() in {"1", "true", "yes"}
-REQUIRE_MRN = os.getenv("REQUIRE_MRN", "false").lower() in {"1", "true", "yes"}
 REQUIRE_DOB = os.getenv("REQUIRE_DOB", "false").lower() in {"1", "true", "yes"}
 REMINDER_HOURS_BEFORE = [
     int(x.strip())

@@ -43,15 +43,27 @@ def _post(payload: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-def send_text(to: str, text: str) -> dict[str, Any]:
+def send_text(to: str, text: str, *, preview_url: bool = True) -> dict[str, Any]:
     return _post(
         {
             "messaging_product": "whatsapp",
             "to": to,
             "type": "text",
-            "text": {"body": text},
+            "text": {"body": text, "preview_url": preview_url},
         }
     )
+
+
+def send_image(to: str, image_url: str, caption: str | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "image",
+        "image": {"link": image_url},
+    }
+    if caption:
+        payload["image"]["caption"] = caption[:1024]
+    return _post(payload)
 
 
 def send_buttons(
@@ -143,6 +155,7 @@ def send_doctor_card(
     profile: str | None = None,
     location: str | None = None,
     lang: str = "ar",
+    include_button: bool = True,
 ) -> dict[str, Any]:
     """
     Interactive image card with Choose button.
@@ -159,6 +172,12 @@ def send_doctor_card(
         profile=profile,
         location=location,
     )
+    if not include_button:
+        # Single WhatsApp bubble: photo + caption (no Choose/Book button).
+        if photo_url:
+            return send_image(to, photo_url, caption=body)
+        return send_text(to, body)
+
     choose_title = i18n.choose_doctor_button(lang, name)
     interactive: dict[str, Any] = {
         "type": "button",
@@ -196,6 +215,8 @@ def send_doctor_cards(
     doctors: list[dict[str, Any]],
     *,
     lang: str = "ar",
+    include_button: bool = True,
+    location: str | None = None,
 ) -> None:
     """Send sequential doctor cards localized for the patient's language."""
     for doc in doctors[:5]:
@@ -208,7 +229,9 @@ def send_doctor_cards(
             specialization=fields["specialization"],
             photo_url=fields["photo_url"] or doc.get("photo_url"),
             profile=fields["bio"],
+            location=location,
             lang=lang,
+            include_button=include_button,
         )
 
 

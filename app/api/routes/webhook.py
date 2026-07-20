@@ -7,11 +7,13 @@ import traceback
 from fastapi import APIRouter, BackgroundTasks, Request
 from fastapi.responses import PlainTextResponse
 
-from app.core.config import VERIFY_TOKEN
+from app.core import i18n_bot as i18n
+from app.core.config import DEFAULT_CLINIC_ID, DEFAULT_TENANT_ID, VERIFY_TOKEN
 from app.db.database import SessionLocal
 from app.db.enums import MessageType, ReminderStatus
 from app.graph import continue_after_doctor_selected, process_incoming_message
 from app.graph.conversation_engine import _sess
+from app.language.language_service import get_conversation_language
 from app.models.reminder_models import Reminder
 from app.services import flow_service
 from app.services.conversation_service import (
@@ -19,10 +21,33 @@ from app.services.conversation_service import (
     log_message,
     log_voice_metadata,
 )
-from app.core.config import DEFAULT_CLINIC_ID, DEFAULT_TENANT_ID
 
 router = APIRouter(tags=["whatsapp"])
 
+
+def _log(msg: str) -> None:
+    """Console-safe logging (Windows cp1252 cannot encode Arabic)."""
+    try:
+        print(msg)
+    except UnicodeEncodeError:
+        print(msg.encode("ascii", errors="replace").decode("ascii"))
+
+
+def _phone_lang(db, phone: str) -> str:
+    """Best-effort conversation language for webhook fallback messages."""
+    sess = _sess(phone)
+    if sess.get("language"):
+        return i18n.normalize_lang(sess["language"])
+    try:
+        conversation = get_or_create_conversation(
+            db,
+            tenant_id=DEFAULT_TENANT_ID,
+            clinic_id=DEFAULT_CLINIC_ID,
+            phone=phone,
+        )
+        return get_conversation_language(conversation, sess)
+    except Exception:
+        return "ar"
 
 @router.get("/webhook")
 async def verify_webhook(request: Request):
@@ -65,19 +90,20 @@ def _extract_user_input(message: dict) -> tuple[str, str | None, str, dict | Non
 
 
 def _handle_flow_completion(phone: str, response_json: str | None) -> None:
-    print(f"[webhook] flow completion from {phone}")
+    _log(f"[webhook] flow completion from {phone}")
     db = SessionLocal()
     try:
         doctor_id = flow_service.parse_flow_completion(response_json)
         if not doctor_id:
             from app.services import whatsapp_client as wa
 
-            wa.send_text(phone, "لم يتم اختيار طبيب. أعد المحاولة من القائمة.")
+            lang = _phone_lang(db, phone)
+            wa.send_text(phone, i18n.webhook_no_doctor_selected(lang))
             return
         continue_after_doctor_selected(db, phone=phone, doctor_id=doctor_id)
-        print(f"[webhook] flow doctor_id={doctor_id} handled")
+        _log(f"[webhook] flow doctor_id={doctor_id} handled")
     except Exception:
-        print("[webhook] ERROR in flow completion:")
+        _log("[webhook] ERROR in flow completion:")
         traceback.print_exc()
     finally:
         db.close()
@@ -89,8 +115,9 @@ def _handle_voice(phone: str, media_id: str | None) -> None:
 
     db = SessionLocal()
     try:
+        lang = _phone_lang(db, phone)
         if not media_id:
-            wa.send_text(phone, "تعذر استلام الملف الصوتي. أعد المحاولة أو اكتب طلبك.")
+            wa.send_text(phone, i18n.webhook_voice_receive_failed(lang))
             return
 
         result = voice_service.transcribe_whatsapp_audio(media_id)
@@ -103,6 +130,7 @@ def _handle_voice(phone: str, media_id: str | None) -> None:
             clinic_id=DEFAULT_CLINIC_ID,
             phone=phone,
         )
+        lang = get_conversation_language(conversation, _sess(phone))
         msg = log_message(
             db,
             conversation_id=conversation.conversation_id,
@@ -122,10 +150,7 @@ def _handle_voice(phone: str, media_id: str | None) -> None:
         db.commit()
 
         if not transcript or confidence < 0.5:
-            wa.send_text(
-                phone,
-                "لم أفهم الرسالة الصوتية بوضوح. أعد التسجيل أو اكتب طلبك نصاً.",
-            )
+            wa.send_text(phone, i18n.webhook_voice_unclear(lang))
             return
 
         sess = _sess(phone)
@@ -133,16 +158,16 @@ def _handle_voice(phone: str, media_id: str | None) -> None:
         sess["voice_transcript"] = transcript
         wa.send_buttons(
             phone,
-            f"فهمت طلبك كالتالي:\n«{transcript}»\nهل هذا صحيح؟ (لن أحجز قبل التأكيد النهائي لاحقاً)",
-            ["نعم صحيح", "إعادة"],
+            i18n.webhook_voice_confirm_prompt(lang, transcript),
+            i18n.webhook_voice_confirm_buttons(lang),
         )
     except Exception:
-        print("[webhook] ERROR while handling voice:")
+        _log("[webhook] ERROR while handling voice:")
         traceback.print_exc()
         try:
             from app.services import whatsapp_client as wa
 
-            wa.send_text(phone, "فشل تحويل الصوت. اكتب طلبك نصاً أو أعد التسجيل.")
+            wa.send_text(phone, i18n.webhook_voice_transcribe_failed(_phone_lang(db, phone)))
         except Exception:
             traceback.print_exc()
     finally:
@@ -150,7 +175,7 @@ def _handle_voice(phone: str, media_id: str | None) -> None:
 
 
 def _handle_message(phone: str, text: str, payload_id: str | None, message_type: str) -> None:
-    print(
+    _log(
         f"[webhook] handle message phone={phone} type={message_type} "
         f"text={text!r} payload={payload_id!r}"
     )
@@ -163,16 +188,16 @@ def _handle_message(phone: str, text: str, payload_id: str | None, message_type:
             payload_id=payload_id,
             message_type=message_type,
         )
-        print(f"[webhook] handled OK phone={phone}")
+        _log(f"[webhook] handled OK phone={phone}")
     except Exception:
-        print("[webhook] ERROR while handling message:")
+        _log("[webhook] ERROR while handling message:")
         traceback.print_exc()
         try:
             from app.services import whatsapp_client as wa
             from app.services import handover_service
             from app.db.enums import HandoverPriority
 
-            wa.send_text(phone, "حصل خطأ مؤقت. نحجز لك متابعة مع الاستقبال.")
+            wa.send_text(phone, i18n.webhook_temporary_error(_phone_lang(db, phone)))
             handover_service.create_handover(
                 db,
                 phone=phone,
@@ -230,7 +255,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
     try:
         value = payload["entry"][0]["changes"][0]["value"]
     except (KeyError, IndexError, TypeError):
-        print("[webhook] ignored malformed payload")
+        _log("[webhook] ignored malformed payload")
         return {"status": "ignored"}
 
     if "messages" not in value:
@@ -242,7 +267,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
     message = value["messages"][0]
     phone = message.get("from")
     text, payload_id, message_type, extra = _extract_user_input(message)
-    print(
+    _log(
         f"[webhook] INCOMING phone={phone} type={message_type} "
         f"text={text!r} payload={payload_id!r}"
     )
