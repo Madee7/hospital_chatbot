@@ -51,11 +51,11 @@ def seed() -> None:
             clinic = Clinic(
                 clinic_id=1,
                 tenant_id=tenant.tenant_id,
-                clinic_name="Demo Heart Clinic",
+                clinic_name="دار الشفاء",
                 whatsapp_number=None,
                 timezone="Africa/Cairo",
                 language_default=Language.AR_EG,
-                address="Cairo, Egypt",
+                address="Dar Al Shfaa",
                 status="active",
                 created_by="seed",
                 updated_by="seed",
@@ -199,6 +199,29 @@ def seed() -> None:
                     clinic_id=clinic.clinic_id,
                     key="booking_slot_minutes",
                     value="30",
+                    created_by="seed",
+                    updated_by="seed",
+                )
+            )
+
+        default_maps = (
+            "https://www.google.com/maps/place/30%C2%B002'49.6%22N+31%C2%B010'57.1%22E/"
+            "@30.0470963,31.1847278,17z/data=!3m1!4b1!4m4!3m3!8m2!3d30.0470963!4d31.1825391?entry=ttu"
+        )
+        if not (
+            db.query(ConfigSetting)
+            .filter(
+                ConfigSetting.clinic_id == clinic.clinic_id,
+                ConfigSetting.key == "clinic_maps_url",
+            )
+            .one_or_none()
+        ):
+            db.add(
+                ConfigSetting(
+                    tenant_id=tenant.tenant_id,
+                    clinic_id=clinic.clinic_id,
+                    key="clinic_maps_url",
+                    value=default_maps,
                     created_by="seed",
                     updated_by="seed",
                 )

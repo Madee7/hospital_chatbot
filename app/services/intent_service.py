@@ -9,6 +9,7 @@ from enum import StrEnum
 from openai import OpenAI
 
 from app.core.config import OPENAI_API_KEY, OPENAI_MODEL
+from app.language.multilingual_prompt import build_system_prompt
 
 
 class Intent(StrEnum):
@@ -43,7 +44,7 @@ def detect_intent_rules(text: str) -> Intent:
     return Intent.UNKNOWN
 
 
-def detect_intent(text: str) -> Intent:
+def detect_intent(text: str, *, lang: str | None = None) -> Intent:
     """Rules first; OpenAI only when unclear and key is configured."""
     intent = detect_intent_rules(text)
     if intent != Intent.UNKNOWN:
@@ -59,10 +60,8 @@ def detect_intent(text: str) -> Intent:
             messages=[
                 {
                     "role": "system",
-                    "content": (
-                        "Classify hospital WhatsApp intents. "
-                        "Return JSON {\"intent\": one of "
-                        "book,update,cancel,ask_doctors,handover,menu,confirm,unknown}."
+                    "content": build_system_prompt(
+                        lang or "ar", purpose="intent_classifier"
                     ),
                 },
                 {"role": "user", "content": text},

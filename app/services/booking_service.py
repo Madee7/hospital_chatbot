@@ -23,7 +23,7 @@ from app.services.conversation_service import (
 )
 from app.services.doctor_service import get_doctor
 from app.services.helpers import generate_appointment_ref
-from app.services.patient_service import get_or_create_patient
+from app.services.patient_service import get_or_create_patient, normalize_person_name
 from app.services.slot_service import (
     earliest_bookable_at,
     ensure_slots_for_doctor,
@@ -175,7 +175,6 @@ def confirm_booking(
     doctor_id: int,
     slot_id: int,
     reason: str | None = None,
-    mrn: str | None = None,
     dob: str | None = None,
     created_channel: str = "whatsapp",
     created_by: str = "bot",
@@ -203,16 +202,12 @@ def confirm_booking(
         clinic_id=clinic_id,
         whatsapp_phone=whatsapp_phone,
         name=patient_name,
-        mrn=mrn,
         dob=dob,
         created_by=created_by,
     )
 
     if patient_name:
-        patient.name = patient_name
-        patient.updated_by = created_by
-    if mrn:
-        patient.mrn = mrn
+        patient.name = normalize_person_name(patient_name)
         patient.updated_by = created_by
     if dob:
         patient.dob = dob

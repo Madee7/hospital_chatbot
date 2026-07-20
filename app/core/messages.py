@@ -23,7 +23,7 @@ def welcome_ar(clinic_name: str | None = None) -> str:
 
 
 def booking_path_prompt_ar() -> str:
-    return "هل تفضّل البحث بالتخصص أم بالطبيب مباشرة؟"
+    return "هل تفضّل البحث بالتخصص أم باسم الدكتور؟"
 
 
 def doctor_card_body_ar(
@@ -144,4 +144,4 @@ MAIN_MENU_LIST_ROWS = [
     "التحدث مع موظف",
 ]
 
-BOOKING_PATH_BUTTONS = ["بالتخصص", "كل الأطباء"]
+BOOKING_PATH_BUTTONS = ["بالتخصص", "باسم الدكتور"]

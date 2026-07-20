@@ -88,14 +88,14 @@ def create_handover(
         patient_msg = patient_message
     elif in_hours:
         patient_msg = (
-            f"تم تحويلك لموظف استقبال في {CLINIC_DISPLAY_NAME}. "
-            "سيتواصل معك قريباً. شكراً لصبرك."
+            f"سيتم تحويلك لموظف الاستقبال في مستشفى {CLINIC_DISPLAY_NAME}، "
+            "وسيتواصل معك قريباً. شكراً لسعة صدرك."
         )
     else:
         patient_msg = (
-            f"تم تسجيل طلبك لدى استقبال {CLINIC_DISPLAY_NAME}. "
-            "نحن خارج أوقات العمل حالياً (الأحد–الخميس 9ص–5م تقريباً)، "
-            "وسنرد في أقرب وقت عمل."
+            f"تم تسجيل طلبك لدى استقبال مستشفى {CLINIC_DISPLAY_NAME}. "
+            "نحن خارج أوقات العمل حالياً، وسنتواصل معك في أقرب وقت. "
+            "شكراً لسعة صدرك."
         )
     wa.send_text(phone, patient_msg)
     log_message(

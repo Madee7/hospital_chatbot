@@ -47,15 +47,22 @@ def language_prompt() -> str:
     )
 
 
+def clinic_name_for_lang(lang: Any, clinic_name: str | None = None) -> str:
+    """Return clinic name in the patient's language."""
+    if clinic_name:
+        return clinic_name
+    return CLINIC_LOCATION if is_english(lang) else CLINIC_DISPLAY_NAME
+
+
 def welcome(lang: Any, clinic_name: str | None = None) -> str:
-    name = clinic_name or CLINIC_DISPLAY_NAME
+    name = clinic_name_for_lang(lang, clinic_name)
     if is_english(lang):
         return f"Welcome to {name} 🏥"
     return f"{name} ترحب بكم 🏥"
 
 
 def main_menu(lang: Any, clinic_name: str | None = None) -> str:
-    name = clinic_name or CLINIC_DISPLAY_NAME
+    name = clinic_name_for_lang(lang, clinic_name)
     if is_english(lang):
         return (
             f"Welcome to {name}. How can we help you?\n"
@@ -103,20 +110,36 @@ def menu_section_title(lang: Any) -> str:
 
 def booking_path_prompt(lang: Any) -> str:
     if is_english(lang):
-        return "Do you prefer searching by specialty or by doctor?"
-    return "هل تفضّل البحث بالتخصص أم بالطبيب مباشرة؟"
+        return "Do you prefer searching by specialty or by doctor name?"
+    return "هل تفضّل البحث بالتخصص أم باسم الدكتور؟"
 
 
-def booking_path_buttons(lang: Any) -> list[str]:
+def booking_path_buttons(lang: Any) -> list[dict[str, str]]:
     if is_english(lang):
-        return ["By specialty", "All doctors"]
-    return ["بالتخصص", "كل الأطباء"]
+        return [
+            {"id": "path_specialty", "title": "By specialty"},
+            {"id": "path_by_doctor", "title": "By doctor name"},
+        ]
+    return [
+        {"id": "path_specialty", "title": "بالتخصص"},
+        {"id": "path_by_doctor", "title": "باسم الدكتور"},
+    ]
 
 
 def inquiry_prompt(lang: Any) -> str:
     if is_english(lang):
-        return "For inquiry: choose a specialty, list all doctors, or type a doctor name."
-    return "للاستفسار: اختر التخصص أو اعرض كل الأطباء، أو اكتب اسم الطبيب."
+        return "For inquiry: choose a specialty, or browse doctors by name."
+    return "للاستفسار: اختر التخصص، أو تصفّح الأطباء بالاسم."
+
+
+def doctors_by_name_prompt(lang: Any) -> str:
+    if is_english(lang):
+        return "Choose a doctor (name and specialty):"
+    return "اختر الطبيب (الاسم والتخصص):"
+
+
+def doctors_list_button_label(lang: Any) -> str:
+    return "Doctors" if is_english(lang) else "الأطباء"
 
 
 def language_saved(lang: Any) -> str:
@@ -289,8 +312,16 @@ HANDOVER_CHOICES = {
     "menu_4",
     "5",
 }
-PATH_SPECIALTY = {"بالتخصص", "By specialty"}
-PATH_ALL_DOCTORS = {"كل الأطباء", "All doctors"}
+PATH_SPECIALTY = {"بالتخصص", "By specialty", "path_specialty"}
+PATH_BY_DOCTOR_NAME = {
+    "باسم الدكتور",
+    "By doctor name",
+    "path_by_doctor",
+    "كل الأطباء",  # legacy label
+    "All doctors",  # legacy label
+}
+# Backward-compatible alias
+PATH_ALL_DOCTORS = PATH_BY_DOCTOR_NAME
 LANG_AR_CHOICES = {"العربية", "Arabic", "lang_ar", "1", "عربي"}
 LANG_EN_CHOICES = {"English", "الانجليزية", "الإنجليزية", "lang_en", "2", "en"}
 
@@ -382,11 +413,12 @@ def doctor_display_fields(doctor_or_dict: Any, lang: Any) -> dict[str, str | Non
         photo = getattr(doctor_or_dict, "photo_url", None)
         doctor_id = getattr(doctor_or_dict, "doctor_id", None)
 
-    dept_label = (dept_en if is_english(lang) else dept_ar) or dept_ar or dept_en
-    if dept_label:
-        specialty = localize_specialty(dept_label, lang) or dept_label
+    if is_english(lang):
+        specialty_source = dept_en or spec or dept_ar
     else:
-        specialty = localize_specialty(spec, lang)
+        specialty_source = dept_ar or spec or dept_en
+
+    specialty = localize_specialty(specialty_source, lang) if specialty_source else None
 
     return {
         "doctor_id": doctor_id,
@@ -427,3 +459,92 @@ def choose_doctor_button(lang: Any, name: str) -> str:
         return f"Select {short}"[:20]
     short = name[:12]
     return f"اختيار {short}"[:20]
+
+
+def ask_patient_full_name(lang: Any) -> str:
+    if is_english(lang):
+        return (
+            "Please enter the patient's full name (at least three names).\n"
+            "Example: Ahmed Mohamed Ali"
+        )
+    return (
+        "برجاء إدخال الاسم الثلاثي للمريض (ثلاثة أسماء على الأقل).\n"
+        "مثال: أحمد محمد علي"
+    )
+
+
+def patient_name_too_short(lang: Any) -> str:
+    if is_english(lang):
+        return (
+            "The name must include at least three parts (full name).\n"
+            "Please enter it again. Example: Ahmed Mohamed Ali"
+        )
+    return (
+        "الاسم يجب أن يكون ثلاثياً على الأقل.\n"
+        "برجاء إعادة الإدخال. مثال: أحمد محمد علي"
+    )
+
+
+def known_patient_prompt(lang: Any, stored_name: str) -> str:
+    if is_english(lang):
+        return (
+            f"This WhatsApp number is already registered as:\n"
+            f"*{stored_name}*\n\n"
+            "Is this the same patient, or has the patient name changed?"
+        )
+    return (
+        f"هذا الرقم مسجّل لدينا باسم:\n"
+        f"*{stored_name}*\n\n"
+        "هل أنت نفس المريض، أم تغيّر اسم المريض؟"
+    )
+
+
+def known_patient_buttons(lang: Any) -> list[str]:
+    if is_english(lang):
+        return ["Same patient", "Name changed"]
+    return ["نفس المريض", "تغيّر الاسم"]
+
+
+SAME_PATIENT_CHOICES = {
+    "نفس المريض",
+    "Same patient",
+    "same",
+    "نعم",
+    "Yes",
+    "yes",
+}
+NAME_CHANGED_CHOICES = {
+    "تغيّر الاسم",
+    "تغير الاسم",
+    "Name changed",
+    "changed",
+    "لا",
+    "No",
+    "no",
+}
+
+
+def hold_timeout_apology(lang: Any) -> str:
+    if is_english(lang):
+        return (
+            "We're sorry — we couldn't complete your appointment booking because "
+            "the time allowed to finish the process has run out. "
+            "No booking was confirmed. Please try again; we'll be happy to help."
+        )
+    return (
+        "نعتذر، لم نتمكن من إكمال حجز موعدك بسبب تجاوز الوقت المخصص لإتمام العملية. "
+        "لم يتم تأكيد أي حجز. يرجى إعادة المحاولة، وسيسعدنا مساعدتك."
+    )
+
+
+def reschedule_hold_timeout_apology(lang: Any) -> str:
+    if is_english(lang):
+        return (
+            "We're sorry — we couldn't complete rescheduling your appointment because "
+            "the time allowed to finish the process has run out. "
+            "Your previous appointment is unchanged. Please try again; we'll be happy to help."
+        )
+    return (
+        "نعتذر، لم نتمكن من إكمال تعديل موعدك بسبب تجاوز الوقت المخصص لإتمام العملية. "
+        "موعدك السابق ما زال كما هو. يرجى إعادة المحاولة، وسيسعدنا مساعدتك."
+    )

@@ -15,6 +15,7 @@ from app.models.conversation_models import Conversation
 from app.models.patient_models import Patient
 from app.models.reminder_models import Reminder
 from app.services import whatsapp_client as wa
+from app.services.clinic_settings_service import format_clinic_location_display
 from app.services.doctor_service import get_doctor
 
 
@@ -203,7 +204,7 @@ def process_due_reminders(
             date_label=slot.slot_start.strftime("%Y-%m-%d"),
             time_label=format_time_12h(slot.slot_start, lang),
             hours_label=_hours_label(reminder.reminder_type),
-            location=None,
+            location=format_clinic_location_display(db, appointment.clinic_id, lang),
         )
 
         if dry_run:

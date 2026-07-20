@@ -20,7 +20,6 @@ class ConfirmBookingRequest(BaseModel):
     doctor_id: int
     slot_id: int
     reason: str | None = None
-    mrn: str | None = None
     dob: str | None = None
     clinic_id: int = DEFAULT_CLINIC_ID
     tenant_id: int = DEFAULT_TENANT_ID
@@ -105,7 +104,6 @@ def api_confirm_booking(
             doctor_id=body.doctor_id,
             slot_id=body.slot_id,
             reason=body.reason,
-            mrn=body.mrn,
             dob=body.dob,
         )
     except BookingError as exc:
