@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from app.core import i18n_bot as i18n
 from app.core.config import CLINIC_DISPLAY_NAME, CLINIC_LOCATION
-from app.language.translation_service import TranslationService
+from app.language.translation_service import NEVER_TRANSLATE_TOKENS
 
 LangCode = Literal["ar", "en"]
 
@@ -23,13 +23,12 @@ def build_system_prompt(
 ) -> str:
     """Build a strict single-language system prompt for the current turn."""
     code: LangCode = i18n.normalize_lang(lang)  # type: ignore[assignment]
-    tx = TranslationService(code)
-    clinic = clinic_name or tx.clinic_name()
+    clinic = clinic_name or i18n.clinic_name_for_lang(code)
     clinic_ar = CLINIC_DISPLAY_NAME
     clinic_en = CLINIC_LOCATION
     label = _lang_label(code)
 
-    never = ", ".join(TranslationService.never_translate_tokens())
+    never = ", ".join(NEVER_TRANSLATE_TOKENS)
 
     language_rules = f"""
 LANGUAGE RULES (mandatory):
@@ -58,10 +57,30 @@ LANGUAGE RULES (mandatory):
 
     if purpose == "intent_classifier":
         return (
-            "Classify hospital WhatsApp intents. "
-            "Return JSON {\"intent\": one of "
-            "book,update,cancel,ask_doctors,handover,menu,confirm,unknown}.\n"
-            f"Patient language context: {label}."
+            "You classify a hospital WhatsApp patient's message into ONE intent.\n"
+            "Return JSON only: {\"intent\": \"<name>\"}.\n\n"
+            "Allowed intents:\n"
+            "- book: wants a NEW appointment / booking\n"
+            "- update: wants to reschedule / change an existing appointment "
+            "(time, day, or doctor)\n"
+            "- cancel: wants to cancel an existing appointment\n"
+            "- ask_doctors: asks about doctors, specialties, or clinic services\n"
+            "- handover: wants a human / reception / agent\n"
+            "- menu: greeting, hello, hi, opening the menu, \"what can you do\", "
+            "or starting the chat without a specific action\n"
+            "- confirm: confirms a yes/confirm action\n"
+            "- thanks: only thanks / ok / done with no new request\n"
+            "- unknown: unrelated or unclear\n\n"
+            "Examples:\n"
+            "- \"مرحبا\" / \"hi\" / \"السلام عليكم\" → menu\n"
+            "- \"بدي أحجز موعد\" / \"I need an appointment\" → book\n"
+            "- \"عدل الموعد\" / \"change my appointment\" → update\n"
+            "- \"الغي الموعد\" / \"cancel\" → cancel\n"
+            "- \"في دكتور قلب؟\" / \"cardiology doctors\" → ask_doctors\n"
+            "- \"موظف\" / \"talk to reception\" → handover\n"
+            "- \"شكرا\" / \"thanks\" → thanks\n\n"
+            f"Patient language context: {label}. "
+            "Understand Arabic or English; pick the best single intent."
         )
 
     if purpose == "rewrite":

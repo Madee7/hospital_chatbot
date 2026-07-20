@@ -119,4 +119,5 @@ def doctor_card_payload(doctor: Doctor) -> dict:
         "department_en": doctor.department.name_en if doctor.department else None,
         "department_ar": doctor.department.name_ar if doctor.department else None,
         "bio": doctor.bio,
+        "bio_en": getattr(doctor, "bio_en", None),
     }

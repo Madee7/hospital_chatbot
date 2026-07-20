@@ -37,7 +37,7 @@ def get_or_create_conversation(
         return conversation
 
     # New chats start without language; the engine detects it from the
-    # first linguistic message (or asks Arabic/English if ambiguous).
+    # first linguistic message (defaults to Arabic if unclear — no picker).
     conversation = Conversation(
         tenant_id=tenant_id,
         clinic_id=clinic_id,

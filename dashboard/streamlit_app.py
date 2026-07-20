@@ -438,7 +438,8 @@ def page_doctors(db, clinic_id: int) -> None:
         specialization = st.text_input(
             "Specialization", value=(current or {}).get("specialization") or ""
         )
-        bio = st.text_area("Bio", value=(current or {}).get("bio") or "")
+        bio = st.text_area("Bio (AR)", value=(current or {}).get("bio") or "")
+        bio_en = st.text_area("Bio (EN)", value=(current or {}).get("bio_en") or "")
         photo_url = st.text_input("Photo URL", value=(current or {}).get("photo_url") or "")
         dept = st.selectbox(
             "Department (required)",
@@ -462,6 +463,7 @@ def page_doctors(db, clinic_id: int) -> None:
                     title=title,
                     specialization=specialization,
                     bio=bio,
+                    bio_en=bio_en or None,
                     photo_url=photo_url or None,
                     department_id=dept,
                     active_flag=active,

@@ -54,10 +54,13 @@ def format_clinic_location_display(
     clinic_id: int,
     lang: Any,
 ) -> str:
-    """Clinic name/address label plus a shortened maps link when configured."""
+    """Clinic name plus shortened maps URL on the next line (same WhatsApp message)."""
     label = i18n.clinic_location(lang)
     maps_url = get_clinic_maps_url(db, clinic_id)
     if not maps_url:
         return label
     short = shorten_google_maps_url(maps_url)
-    return f"{label}\n{short}" if short else label
+    if not short:
+        return label
+    # Same format as before: "Dar Al Shfaa\nhttps://maps.google.com/?q=..."
+    return f"{label}\n{short}"

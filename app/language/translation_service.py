@@ -10,7 +10,6 @@ from __future__ import annotations
 from typing import Any
 
 from app.core import i18n_bot as i18n
-from app.core.config import CLINIC_DISPLAY_NAME, CLINIC_LOCATION
 
 
 class TranslationService:
@@ -51,9 +50,17 @@ class TranslationService:
             name_ar = getattr(dept_or_dict, "name_ar", None)
             name_en = getattr(dept_or_dict, "name_en", None)
             dept_id = getattr(dept_or_dict, "department_id", "?")
-        if self.is_english:
-            return (name_en or name_ar or f"Department {dept_id}") or ""
-        return (name_ar or name_en or f"Department {dept_id}") or ""
+        picked = i18n.pick_bilingual_field(
+            en=name_en,
+            ar=name_ar,
+            lang=self.lang,
+            allow_cross_script=False,
+            fallback=None,
+        )
+        if picked:
+            return picked
+        # Last resort so specialty lists are never blank.
+        return (name_en or name_ar or f"Department {dept_id}") or ""
 
     def patient_display_name(self, canonical_name: str | None) -> str:
         """Patients usually have one stored name; return it unchanged.
@@ -62,26 +69,16 @@ class TranslationService:
         """
         return (canonical_name or "").strip()
 
-    @staticmethod
-    def never_translate_tokens() -> tuple[str, ...]:
-        return (
-            "uuid",
-            "booking_id",
-            "appointment_ref",
-            "database_id",
-            "url",
-            "email",
-            "phone",
-            "date",
-            "time",
-        )
 
-
-# Convenience aliases matching i18n clinic branding
-def default_clinic_labels(lang: Any) -> tuple[str, str]:
-    """Return (arabic_name, english_name) for prompts — not for DB writes."""
-    ar = CLINIC_DISPLAY_NAME
-    en = CLINIC_LOCATION
-    if i18n.is_english(lang):
-        return ar, en
-    return ar, en
+# Tokens that must never be rewritten by LLM translation helpers.
+NEVER_TRANSLATE_TOKENS = (
+    "uuid",
+    "booking_id",
+    "appointment_ref",
+    "database_id",
+    "url",
+    "email",
+    "phone",
+    "date",
+    "time",
+)

@@ -182,7 +182,6 @@ def process_due_reminders(
             continue
 
         doctor = get_doctor(db, appointment.doctor_id, clinic_id=appointment.clinic_id)
-        doctor_name = (doctor.name_ar or doctor.name_en) if doctor else f"#{appointment.doctor_id}"
         lang = "ar"
         prev_conv = (
             db.query(Conversation)
@@ -195,8 +194,11 @@ def process_due_reminders(
         )
         if prev_conv and prev_conv.language is not None:
             lang = i18n.normalize_lang(prev_conv.language)
-        if i18n.is_english(lang):
-            doctor_name = (doctor.name_en or doctor.name_ar) if doctor else doctor_name
+        doctor_name = (
+            i18n.doctor_display_name(doctor, lang)
+            if doctor
+            else f"#{appointment.doctor_id}"
+        )
         body = i18n.reminder(
             lang,
             appointment_ref=appointment.appointment_ref or str(appointment.appointment_id),

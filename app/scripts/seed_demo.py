@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from datetime import time
 
-from app.db.database import SessionLocal, create_tables
+from sqlalchemy import text
+
+from app.db.database import SessionLocal, create_tables, engine
 from app.db.enums import Language
 from app.models.admin_models import AdminUser, ConfigSetting
 from app.models.core_models import Clinic, Department, Tenant
@@ -31,8 +33,44 @@ PHOTO_SENIOR = (
 )
 
 
+def _ensure_doctor_bio_en_column() -> None:
+    """Add bio_en if missing (demo DBs created before bilingual bios)."""
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "ALTER TABLE doctors ADD COLUMN IF NOT EXISTS bio_en TEXT"
+            )
+        )
+
+
+def _synthesize_bio_en(doctor: Doctor) -> str:
+    from app.core.i18n_bot import has_arabic_script, localize_specialty, localize_title
+
+    title = localize_title(doctor.title, "en") or "Specialist"
+    if has_arabic_script(title):
+        title = "Specialist"
+    spec = localize_specialty(doctor.specialization, "en") or "Medicine"
+    if has_arabic_script(spec):
+        spec = "Medicine"
+    return f"{title} in {spec}"
+
+
+def _backfill_missing_bio_en(db, clinic_id: int) -> int:
+    """Ensure every doctor has bio_en so English WhatsApp cards never fall back to Arabic."""
+    updated = 0
+    doctors = db.query(Doctor).filter(Doctor.clinic_id == clinic_id).all()
+    for doctor in doctors:
+        if (getattr(doctor, "bio_en", None) or "").strip():
+            continue
+        doctor.bio_en = _synthesize_bio_en(doctor)
+        doctor.updated_by = "seed"
+        updated += 1
+    return updated
+
+
 def seed() -> None:
     create_tables()
+    _ensure_doctor_bio_en_column()
     db = SessionLocal()
     try:
         tenant = db.query(Tenant).filter(Tenant.tenant_id == 1).one_or_none()
@@ -91,6 +129,7 @@ def seed() -> None:
                 "title": "Consultant",
                 "specialization": "Cardiology",
                 "bio": "استشاري قلب — خبرة 12 سنة",
+                "bio_en": "Cardiology consultant — 12 years experience",
                 "photo_url": PHOTO_MALE,
                 "weekdays": [0, 2, 4],  # Mon, Wed, Fri
                 "start": time(9, 0),
@@ -102,6 +141,7 @@ def seed() -> None:
                 "title": "Specialist",
                 "specialization": "Cardiology",
                 "bio": "أخصائي قلب وأوعية — خبرة 8 سنوات",
+                "bio_en": "Cardiology & vascular specialist — 8 years experience",
                 "photo_url": PHOTO_FEMALE,
                 "weekdays": [1, 3],  # Tue, Thu
                 "start": time(14, 0),
@@ -113,6 +153,7 @@ def seed() -> None:
                 "title": "Consultant",
                 "specialization": "Cardiology",
                 "bio": "استشاري قسطرة قلب — خبرة 10 سنوات",
+                "bio_en": "Cardiac catheterization consultant — 10 years experience",
                 "photo_url": PHOTO_SENIOR,
                 "weekdays": [0, 1, 3],  # Mon, Tue, Thu
                 "start": time(10, 0),
@@ -124,6 +165,7 @@ def seed() -> None:
                 "title": "Specialist",
                 "specialization": "Cardiology",
                 "bio": "أخصائي قلب أطفال وكبار — خبرة 6 سنوات",
+                "bio_en": "Adult & pediatric cardiology specialist — 6 years experience",
                 "photo_url": PHOTO_MALE,
                 "weekdays": [2, 5],  # Wed, Sat
                 "start": time(16, 0),
@@ -141,6 +183,10 @@ def seed() -> None:
                 .one_or_none()
             )
             if existing:
+                # Keep demo bios bilingual even for previously seeded rows.
+                existing.bio = spec["bio"]
+                existing.bio_en = spec["bio_en"]
+                existing.updated_by = "seed"
                 continue
 
             doctor = Doctor(
@@ -152,6 +198,7 @@ def seed() -> None:
                 title=spec["title"],
                 specialization=spec["specialization"],
                 bio=spec["bio"],
+                bio_en=spec["bio_en"],
                 photo_url=spec["photo_url"],
                 active_flag=True,
                 created_by="seed",
@@ -228,7 +275,12 @@ def seed() -> None:
             )
 
         db.commit()
-        print("Seed completed: tenant=1 clinic=1 Cardiology doctors ready.")
+        backfilled = _backfill_missing_bio_en(db, clinic.clinic_id)
+        db.commit()
+        print(
+            "Seed completed: tenant=1 clinic=1 Cardiology doctors ready"
+            + (f" (bio_en backfilled={backfilled})." if backfilled else ".")
+        )
     except Exception:
         db.rollback()
         raise
