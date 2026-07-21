@@ -110,8 +110,8 @@ def _handle_flow_completion(phone: str, response_json: str | None) -> None:
 
 
 def _handle_voice(phone: str, media_id: str | None) -> None:
-    """UC-006: download + STT, confirm understanding, then enter guided flow."""
-    from app.services import voice_service, whatsapp_client as wa
+    """Audio layer: Whisper+GPT route, then GitHub booking engine."""
+    from app.services import voice_fastpath, voice_service, whatsapp_client as wa
 
     db = SessionLocal()
     try:
@@ -120,9 +120,15 @@ def _handle_voice(phone: str, media_id: str | None) -> None:
             wa.send_text(phone, i18n.webhook_voice_receive_failed(lang))
             return
 
-        result = voice_service.transcribe_whatsapp_audio(media_id)
-        transcript = result.get("text") or ""
+        sess = _sess(phone)
+        options = list(sess.get("last_options") or [])
+        result = voice_service.route_whatsapp_voice_message(media_id, options=options)
+        transcript = (result.get("transcript") or result.get("text") or "").strip()
         confidence = float(result.get("confidence") or 0)
+        intent = (result.get("intent") or "unknown").strip().lower()
+        action = (result.get("action") or "clarify").strip().lower()
+        summary = (result.get("summary_ar") or "").strip()
+        option_id = result.get("selected_option_id")
 
         conversation = get_or_create_conversation(
             db,
@@ -130,13 +136,13 @@ def _handle_voice(phone: str, media_id: str | None) -> None:
             clinic_id=DEFAULT_CLINIC_ID,
             phone=phone,
         )
-        lang = get_conversation_language(conversation, _sess(phone))
+        lang = get_conversation_language(conversation, sess)
         msg = log_message(
             db,
             conversation_id=conversation.conversation_id,
             direction="inbound",
             message_type=MessageType.VOICE,
-            text=transcript or "(voice)",
+            text=transcript or summary or f"(voice:{intent})",
             status="received",
         )
         log_voice_metadata(
@@ -149,25 +155,56 @@ def _handle_voice(phone: str, media_id: str | None) -> None:
         )
         db.commit()
 
-        if not transcript or confidence < 0.5:
+        awaiting = sess.get("awaiting")
+        if awaiting in {"patient_name", "mrn_value", "dob_value"} and transcript:
+            process_incoming_message(
+                db,
+                phone=phone,
+                text=transcript,
+                payload_id=None,
+                message_type="text",
+            )
+            return
+
+        if (action == "clarify" or confidence < 0.5) and not (
+            action == "select_option" and option_id
+        ):
             wa.send_text(phone, i18n.webhook_voice_unclear(lang))
             return
 
-        sess = _sess(phone)
-        sess["awaiting"] = "voice_confirm"
-        sess["voice_transcript"] = transcript
-        wa.send_buttons(
-            phone,
-            i18n.webhook_voice_confirm_prompt(lang, transcript),
-            i18n.webhook_voice_confirm_buttons(lang),
-        )
+        if voice_fastpath.try_voice_smart_route(db, phone=phone, result=result):
+            return
+
+        if action == "select_option" and option_id:
+            process_incoming_message(
+                db,
+                phone=phone,
+                text=transcript or str(option_id),
+                payload_id=str(option_id),
+                message_type="interactive",
+            )
+            return
+
+        if transcript:
+            process_incoming_message(
+                db,
+                phone=phone,
+                text=transcript,
+                payload_id=None,
+                message_type="text",
+            )
+            return
+
+        wa.send_text(phone, i18n.webhook_voice_unclear(lang))
     except Exception:
         _log("[webhook] ERROR while handling voice:")
         traceback.print_exc()
         try:
             from app.services import whatsapp_client as wa
 
-            wa.send_text(phone, i18n.webhook_voice_transcribe_failed(_phone_lang(db, phone)))
+            wa.send_text(
+                phone, i18n.webhook_voice_transcribe_failed(_phone_lang(db, phone))
+            )
         except Exception:
             traceback.print_exc()
     finally:

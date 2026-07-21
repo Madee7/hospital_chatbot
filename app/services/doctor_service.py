@@ -2,10 +2,60 @@
 
 from __future__ import annotations
 
+import re
 from sqlalchemy.orm import Session, joinedload
 
 from app.models.core_models import Department
 from app.models.doctor_models import Doctor
+
+# Spoken aliases → match against department name_ar / name_en
+_SPECIALTY_ALIASES: dict[str, tuple[str, ...]] = {
+    "قلب": ("قلب", "قلبية", "القلب", "cardiology", "cardio", "cardiac"),
+    "عظام": ("عظام", "orthopedics", "orthopaedics", "ortho"),
+    "جلدية": ("جلدية", "جلد", "dermatology", "derma"),
+    "أطفال": ("أطفال", "طفل", "pediatrics", "paediatrics", "pediatric"),
+    "عيون": ("عيون", "عين", "ophthalmology", "eye"),
+    "أسنان": ("أسنان", "سن", "dentistry", "dental", "dentist"),
+    "باطنة": ("باطنة", "باطني", "internal medicine", "internal"),
+    "أعصاب": ("أعصاب", "neurology", "neuro"),
+    "نساء": ("نساء", "توليد", "نسا", "obgyn", "gynecology", "gynaecology"),
+}
+
+
+def specialty_alias_words() -> set[str]:
+    """Flattened specialty words/aliases for voice routing (single source of truth)."""
+    words: set[str] = set()
+    for canonical, aliases in _SPECIALTY_ALIASES.items():
+        words.add(canonical)
+        words.update(aliases)
+    return words
+
+
+def is_specialty_word(text: str | None) -> bool:
+    """True if text (after stripping دكتور/dr) matches a known specialty alias."""
+    if not text or not str(text).strip():
+        return False
+    stripped = re.sub(
+        r"^(د\.|دكتور|الدكتور|dr\.?)\s*",
+        "",
+        str(text).strip(),
+        flags=re.I,
+    ).strip()
+    if not stripped:
+        return False
+    needle = _norm_ar(stripped)
+    for word in specialty_alias_words():
+        if needle == _norm_ar(word):
+            return True
+    return False
+
+
+def _norm_ar(text: str) -> str:
+    """Normalize Arabic letters for loose matching (أ/إ/آ→ا, ة→ه, ى→ي)."""
+    s = (text or "").strip().lower()
+    for src, dst in (("أ", "ا"), ("إ", "ا"), ("آ", "ا"), ("ة", "ه"), ("ى", "ي")):
+        s = s.replace(src, dst)
+    return re.sub(r"\s+", " ", s)
 
 
 def list_departments(db: Session, clinic_id: int) -> list[Department]:
@@ -37,27 +87,77 @@ def find_department(
     if not name:
         return None
 
-    cleaned = name.strip().lower()
+    # Strip "دكتور قلب" → "قلب"
+    raw = re.sub(
+        r"^(د\.|دكتور|الدكتور|dr\.?)\s*",
+        "",
+        name.strip(),
+        flags=re.I,
+    ).strip()
+    cleaned = _norm_ar(raw)
+    if not cleaned:
+        return None
+
     departments = query.all()
+
+    def _dept_blob(dept: Department) -> str:
+        return _norm_ar(f"{dept.name_ar or ''} {dept.name_en or ''}")
+
     # Exact match first
     for dept in departments:
         candidates = [
-            (dept.name_en or "").strip().lower(),
-            (dept.name_ar or "").strip().lower(),
+            _norm_ar(dept.name_en or ""),
+            _norm_ar(dept.name_ar or ""),
         ]
         if cleaned in candidates:
             return dept
-    # Soft match only for reasonably long queries to avoid false positives ("ا", "med")
-    if len(cleaned) < 3:
+
+    # Alias table (قلب → Cardiology, etc.)
+    for _canonical, aliases in _SPECIALTY_ALIASES.items():
+        alias_norms = {_norm_ar(a) for a in aliases}
+        if cleaned in alias_norms or any(a and a in cleaned for a in alias_norms):
+            for dept in departments:
+                blob = _dept_blob(dept)
+                if any(a in blob for a in alias_norms if len(a) >= 2):
+                    return dept
+
+    # Soft containment (min 2 chars for Arabic specialty words like قلب)
+    if len(cleaned) < 2:
         return None
     for dept in departments:
-        candidates = [
-            (dept.name_en or "").strip().lower(),
-            (dept.name_ar or "").strip().lower(),
-        ]
-        for candidate in candidates:
-            if candidate and (cleaned in candidate or candidate in cleaned):
+        blob = _dept_blob(dept)
+        if blob and (cleaned in blob or blob in cleaned):
+            return dept
+    return None
+
+
+def infer_department_from_text(
+    db: Session,
+    clinic_id: int,
+    text: str | None,
+) -> Department | None:
+    """Find a department mentioned inside free text / voice transcript."""
+    if not text or not text.strip():
+        return None
+    blob = _norm_ar(text)
+    # Prefer longer department names first
+    departments = sorted(
+        list_departments(db, clinic_id),
+        key=lambda d: max(len(d.name_ar or ""), len(d.name_en or "")),
+        reverse=True,
+    )
+    for dept in departments:
+        for label in (dept.name_ar, dept.name_en):
+            n = _norm_ar(label or "")
+            if len(n) >= 2 and n in blob:
                 return dept
+    for aliases in _SPECIALTY_ALIASES.values():
+        for alias in aliases:
+            n = _norm_ar(alias)
+            if len(n) >= 2 and n in blob:
+                found = find_department(db, clinic_id, name=alias)
+                if found:
+                    return found
     return None
 
 
@@ -66,7 +166,7 @@ def list_doctors_by_department(
     *,
     clinic_id: int,
     department_id: int,
-    limit: int = 5,
+    limit: int = 10,
 ) -> list[Doctor]:
     return (
         db.query(Doctor)
