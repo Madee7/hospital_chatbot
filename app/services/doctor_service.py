@@ -208,16 +208,25 @@ def get_doctor(db: Session, doctor_id: int, clinic_id: int | None = None) -> Doc
 
 def doctor_card_payload(doctor: Doctor) -> dict:
     """Compact card payload for WhatsApp / API responses."""
+    from app.core import i18n_bot as i18n
+
+    dept_en = doctor.department.name_en if doctor.department else None
+    dept_ar = doctor.department.name_ar if doctor.department else None
+    normalized = i18n.normalize_doctor_bilingual_fields(
+        doctor,
+        department_en=dept_en,
+        department_ar=dept_ar,
+    )
     return {
         "doctor_id": doctor.doctor_id,
-        "name_en": doctor.name_en,
-        "name_ar": doctor.name_ar,
+        "name_en": normalized["name_en"] or doctor.name_en,
+        "name_ar": normalized["name_ar"] or doctor.name_ar,
         "title": doctor.title,
         "specialization": doctor.specialization,
         "photo_url": doctor.photo_url,
         "department_id": doctor.department_id,
-        "department_en": doctor.department.name_en if doctor.department else None,
-        "department_ar": doctor.department.name_ar if doctor.department else None,
-        "bio": doctor.bio,
-        "bio_en": getattr(doctor, "bio_en", None),
+        "department_en": dept_en,
+        "department_ar": dept_ar,
+        "bio": normalized["bio"],
+        "bio_en": normalized["bio_en"],
     }

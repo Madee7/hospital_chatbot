@@ -458,6 +458,158 @@ def has_arabic_script(text: str | None) -> bool:
     return bool(text and _ARABIC_SCRIPT_RE.search(text))
 
 
+def _clean_text(value: str | None) -> str | None:
+    cleaned = (value or "").strip()
+    return cleaned or None
+
+
+def synthesize_doctor_bio_en(
+    *,
+    title: str | None = None,
+    specialization: str | None = None,
+    department_en: str | None = None,
+) -> str:
+    """Build a safe English bio when ``bio_en`` is missing or mis-labeled."""
+    title_en = localize_title(title, "en") or "Specialist"
+    if has_arabic_script(title_en):
+        title_en = "Specialist"
+    spec = (
+        localize_specialty(department_en, "en")
+        or localize_specialty(specialization, "en")
+        or "Medicine"
+    )
+    if has_arabic_script(spec):
+        spec = "Medicine"
+    return f"{title_en} in {spec}"
+
+
+def synthesize_doctor_bio_ar(
+    *,
+    title: str | None = None,
+    specialization: str | None = None,
+    department_ar: str | None = None,
+) -> str:
+    """Build a safe Arabic bio when ``bio`` is missing or mis-labeled."""
+    title_ar = localize_title(title, "ar") or "أخصائي"
+    if not has_arabic_script(title_ar) and title:
+        title_ar = localize_title(title, "ar") or "أخصائي"
+    spec = (
+        localize_specialty(department_ar, "ar")
+        or localize_specialty(specialization, "ar")
+        or "الطب"
+    )
+    return f"{title_ar} — {spec}"
+
+
+def normalize_doctor_bilingual_fields(
+    doctor_or_dict: Any | None = None,
+    *,
+    name_en: str | None = None,
+    name_ar: str | None = None,
+    bio: str | None = None,
+    bio_en: str | None = None,
+    title: str | None = None,
+    specialization: str | None = None,
+    department_en: str | None = None,
+    department_ar: str | None = None,
+) -> dict[str, str | None]:
+    """Repair mixed/missing EN/AR doctor fields before display or save.
+
+    Handles common production issues (local DB fixed, cloud DB still dirty):
+    - Arabic text stored in ``bio_en`` / ``name_en``
+    - English text stored in ``bio`` / ``name_ar``
+    - Missing ``bio_en`` or ``bio`` → synthesize from title/specialty
+    """
+    if doctor_or_dict is not None and name_en is None and name_ar is None:
+        if isinstance(doctor_or_dict, dict):
+            name_en = doctor_or_dict.get("name_en")
+            name_ar = doctor_or_dict.get("name_ar")
+            bio = doctor_or_dict.get("bio") if bio is None else bio
+            bio_en = doctor_or_dict.get("bio_en") if bio_en is None else bio_en
+            title = doctor_or_dict.get("title") if title is None else title
+            specialization = (
+                doctor_or_dict.get("specialization")
+                if specialization is None
+                else specialization
+            )
+            department_en = (
+                doctor_or_dict.get("department_en")
+                if department_en is None
+                else department_en
+            )
+            department_ar = (
+                doctor_or_dict.get("department_ar")
+                if department_ar is None
+                else department_ar
+            )
+        else:
+            name_en = getattr(doctor_or_dict, "name_en", None)
+            name_ar = getattr(doctor_or_dict, "name_ar", None)
+            bio = getattr(doctor_or_dict, "bio", None) if bio is None else bio
+            bio_en = getattr(doctor_or_dict, "bio_en", None) if bio_en is None else bio_en
+            title = getattr(doctor_or_dict, "title", None) if title is None else title
+            specialization = (
+                getattr(doctor_or_dict, "specialization", None)
+                if specialization is None
+                else specialization
+            )
+            dept = getattr(doctor_or_dict, "department", None)
+            if department_en is None:
+                department_en = getattr(dept, "name_en", None) if dept else None
+            if department_ar is None:
+                department_ar = getattr(dept, "name_ar", None) if dept else None
+
+    name_en_s = _clean_text(name_en)
+    name_ar_s = _clean_text(name_ar)
+    bio_ar_s = _clean_text(bio)
+    bio_en_s = _clean_text(bio_en)
+
+    # Swap mis-labeled names.
+    if name_en_s and has_arabic_script(name_en_s) and not name_ar_s:
+        name_ar_s, name_en_s = name_en_s, None
+    if name_ar_s and not has_arabic_script(name_ar_s) and not name_en_s:
+        name_en_s, name_ar_s = name_ar_s, None
+    if name_en_s and has_arabic_script(name_en_s):
+        # Keep Arabic name if AR empty; never use Arabic as EN.
+        if not name_ar_s:
+            name_ar_s = name_en_s
+        name_en_s = None
+
+    # Swap mis-labeled bios.
+    if bio_en_s and has_arabic_script(bio_en_s):
+        if not bio_ar_s:
+            bio_ar_s = bio_en_s
+        bio_en_s = None
+    if bio_ar_s and not has_arabic_script(bio_ar_s):
+        if not bio_en_s:
+            bio_en_s = bio_ar_s
+        bio_ar_s = None
+
+    if not bio_en_s:
+        bio_en_s = synthesize_doctor_bio_en(
+            title=title,
+            specialization=specialization,
+            department_en=department_en,
+        )
+    if not bio_ar_s:
+        bio_ar_s = synthesize_doctor_bio_ar(
+            title=title,
+            specialization=specialization,
+            department_ar=department_ar,
+        )
+
+    return {
+        "name_en": name_en_s,
+        "name_ar": name_ar_s,
+        "bio": bio_ar_s,
+        "bio_en": bio_en_s,
+        "title": _clean_text(title),
+        "specialization": _clean_text(specialization),
+        "department_en": _clean_text(department_en),
+        "department_ar": _clean_text(department_ar),
+    }
+
+
 def pick_bilingual_field(
     *,
     en: str | None,
@@ -569,24 +721,21 @@ def doctor_display_fields(doctor_or_dict: Any, lang: Any) -> dict[str, str | Non
 
     Specialty on cards follows the doctor's department (booking specialty filter),
     not a stale free-text specialization that may disagree with department_id.
+    Always normalizes bilingual fields so cloud DBs with missing/mis-labeled
+    ``bio_en`` / ``name_en`` still render clean single-language cards.
     """
+    normalized = normalize_doctor_bilingual_fields(doctor_or_dict)
+    title = normalized.get("title")
+    spec = normalized.get("specialization")
+    dept_ar = normalized.get("department_ar")
+    dept_en = normalized.get("department_en")
+    bio_ar = normalized.get("bio")
+    bio_en = normalized.get("bio_en")
+
     if isinstance(doctor_or_dict, dict):
-        title = doctor_or_dict.get("title")
-        spec = doctor_or_dict.get("specialization")
-        dept_ar = doctor_or_dict.get("department_ar")
-        dept_en = doctor_or_dict.get("department_en")
-        bio_ar = doctor_or_dict.get("bio")
-        bio_en = doctor_or_dict.get("bio_en")
         photo = doctor_or_dict.get("photo_url")
         doctor_id = doctor_or_dict.get("doctor_id")
     else:
-        title = getattr(doctor_or_dict, "title", None)
-        spec = getattr(doctor_or_dict, "specialization", None)
-        dept = getattr(doctor_or_dict, "department", None)
-        dept_ar = getattr(dept, "name_ar", None) if dept else None
-        dept_en = getattr(dept, "name_en", None) if dept else None
-        bio_ar = getattr(doctor_or_dict, "bio", None)
-        bio_en = getattr(doctor_or_dict, "bio_en", None)
         photo = getattr(doctor_or_dict, "photo_url", None)
         doctor_id = getattr(doctor_or_dict, "doctor_id", None)
 
@@ -604,9 +753,16 @@ def doctor_display_fields(doctor_or_dict: Any, lang: Any) -> dict[str, str | Non
     # Never fall back across scripts for bios (root cause of EN cards + AR text).
     bio = pick_bilingual_field(en=bio_en, ar=bio_ar, lang=lang, allow_cross_script=False)
 
+    # Build a temporary object for name picking from normalized fields.
+    name_source = {
+        "name_en": normalized.get("name_en"),
+        "name_ar": normalized.get("name_ar"),
+        "doctor_id": doctor_id,
+    }
+
     return {
         "doctor_id": doctor_id,
-        "name": doctor_display_name(doctor_or_dict, lang),
+        "name": doctor_display_name(name_source, lang),
         "title": localize_title(title, lang),
         "specialization": specialty,
         "bio": bio,

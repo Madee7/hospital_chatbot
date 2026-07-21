@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session
 
+from app.core import i18n_bot as i18n
 from app.db.enums import AppointmentStatus, ConversationState, ReminderStatus
 from app.models.admin_models import AdminUser, ConfigSetting
 from app.models.appointment_models import Appointment, AppointmentHistory, AppointmentSlot
@@ -220,14 +221,26 @@ def upsert_doctor(
             created_by=updated_by,
         )
         db.add(doctor)
-    doctor.name_en = name_en
-    doctor.name_ar = name_ar
-    doctor.title = title
     # Keep free-text specialization aligned with the department used in booking filters.
     synced_spec = (specialization or "").strip() or (dept.name_en or dept.name_ar)
+    # Repair mixed/missing bilingual fields so WhatsApp cards stay single-language
+    # even when cloud DBs (e.g. Supabase) have incomplete rows.
+    normalized = i18n.normalize_doctor_bilingual_fields(
+        name_en=name_en,
+        name_ar=name_ar,
+        bio=bio,
+        bio_en=bio_en,
+        title=title,
+        specialization=synced_spec,
+        department_en=dept.name_en,
+        department_ar=dept.name_ar,
+    )
+    doctor.name_en = normalized["name_en"] or name_en
+    doctor.name_ar = normalized["name_ar"] or name_ar
+    doctor.title = title
     doctor.specialization = synced_spec
-    doctor.bio = bio
-    doctor.bio_en = bio_en
+    doctor.bio = normalized["bio"]
+    doctor.bio_en = normalized["bio_en"]
     doctor.photo_url = photo_url
     doctor.department_id = department_id
     doctor.active_flag = active_flag
