@@ -1,7 +1,11 @@
 import os
+from pathlib import Path
+
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load repo-root .env (utf-8-sig strips Windows BOM that breaks key names)
+_ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
+load_dotenv(_ENV_PATH, encoding="utf-8-sig", override=True)
 
 # WhatsApp
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
@@ -17,10 +21,21 @@ WHATSAPP_FLOW_CTA = os.getenv("WHATSAPP_FLOW_CTA", "عرض الأطباء")
 # Use true while testing an unpublished (Draft) Flow in Meta.
 WHATSAPP_FLOW_DRAFT = os.getenv("WHATSAPP_FLOW_DRAFT", "false").lower() in {"1", "true", "yes"}
 
-# AI providers
+# AI providers (OpenAI for voice — Whisper STT + GPT structure)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_STT_MODEL = os.getenv("OPENAI_STT_MODEL", "whisper-1")
+OPENAI_VOICE_STRUCTURE_MODEL = os.getenv(
+    "OPENAI_VOICE_STRUCTURE_MODEL",
+    os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+)
+VOICE_REQUIRE_CONFIRM = os.getenv("VOICE_REQUIRE_CONFIRM", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+VOICE_SKIP_CONFIRM_THRESHOLD = float(os.getenv("VOICE_SKIP_CONFIRM_THRESHOLD", "0.55"))
 
 # Database
 DATABASE_URL = os.getenv(
