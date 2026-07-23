@@ -1,0 +1,26 @@
+name: Deploy to Windows server
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.6.0
+        with:
+          host: YOUR_SERVER_IP_OR_DNS
+          username: Administrator
+          key: ${{ secrets.WINDOWS_SSH_KEY }}
+          script: |
+            cd C:\apps\hospital-chatbot
+            git pull
+            .\venv\Scripts\pip.exe install -r requirements.txt
+            Restart-Service HospitalChatbotBackend
+            Restart-Service HospitalDashboard
