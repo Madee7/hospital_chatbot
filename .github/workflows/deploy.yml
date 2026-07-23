@@ -15,7 +15,7 @@ jobs:
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.6.0
         with:
-          host: YOUR_SERVER_IP_OR_DNS
+          host: 196.219.86.38
           username: Administrator
           key: ${{ secrets.WINDOWS_SSH_KEY }}
           script: |
