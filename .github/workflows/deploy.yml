@@ -10,7 +10,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Deploy via SSH
         uses: appleboy/ssh-action@master
@@ -18,6 +18,7 @@ jobs:
           host: 196.219.86.38
           username: Administrator
           key: ${{ secrets.WINDOWS_SSH_KEY }}
+          port: 22
           script: |
             cd C:\apps\hospital-chatbot
             git pull
