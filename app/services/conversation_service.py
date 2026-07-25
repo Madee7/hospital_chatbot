@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.db.enums import ConversationState, Language, MessageType
 from app.models.conversation_models import Conversation, Message, VoiceMessage
+from app.models.usage_models import UsageLog
 
 
 def get_or_create_conversation(
@@ -125,3 +126,74 @@ def log_voice_metadata(
     db.add(voice)
     db.flush()
     return voice
+
+
+def log_usage(
+    db: Session,
+    *,
+    tenant_id: int,
+    clinic_id: int,
+    provider: str,
+    operation: str,
+    cost_estimate: float,
+    tokens_or_minutes: int | None = None,
+    latency_ms: int | None = None,
+    status: str = "completed",
+) -> UsageLog:
+    """Record one AI-provider usage/cost row (feeds dashboard KPIs + Usage page)."""
+    row = UsageLog(
+        tenant_id=tenant_id,
+        clinic_id=clinic_id,
+        provider=provider,
+        operation=operation,
+        cost_estimate=cost_estimate,
+        tokens_or_minutes=tokens_or_minutes,
+        latency_ms=latency_ms,
+        status=status,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def log_voice_call_cost(
+    db: Session,
+    *,
+    tenant_id: int,
+    clinic_id: int,
+    cost: dict | None,
+    status: str = "completed",
+) -> None:
+    """Persist a voice call's cost breakdown as UsageLog rows (STT + GPT parse).
+
+    `cost` is the dict returned by voice_service (voice_cost.estimate_voice_call_cost).
+    Two rows are written so the dashboard can break cost down by provider/operation.
+    """
+    if not cost:
+        return
+
+    stt_seconds = float(cost.get("stt_seconds") or 0)
+    log_usage(
+        db,
+        tenant_id=tenant_id,
+        clinic_id=clinic_id,
+        provider=str(cost.get("stt_model") or "openai_stt"),
+        operation="voice_stt",
+        cost_estimate=float(cost.get("stt_usd") or 0.0),
+        tokens_or_minutes=int(round(stt_seconds)),
+        status=status,
+    )
+
+    total_tokens = int(cost.get("prompt_tokens") or 0) + int(
+        cost.get("completion_tokens") or 0
+    )
+    log_usage(
+        db,
+        tenant_id=tenant_id,
+        clinic_id=clinic_id,
+        provider=str(cost.get("chat_model") or "openai_gpt"),
+        operation="voice_parse",
+        cost_estimate=float(cost.get("chat_usd") or 0.0),
+        tokens_or_minutes=total_tokens,
+        status=status,
+    )

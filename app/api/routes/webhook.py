@@ -19,6 +19,7 @@ from app.services import flow_service
 from app.services.conversation_service import (
     get_or_create_conversation,
     log_message,
+    log_voice_call_cost,
     log_voice_metadata,
 )
 
@@ -109,6 +110,89 @@ def _handle_flow_completion(phone: str, response_json: str | None) -> None:
         db.close()
 
 
+def _voice_current_step(db, sess: dict, conversation) -> dict | None:
+    """Compact booking-step snapshot for Whisper/GPT voice context (Task C)."""
+    from app.services import doctor_service
+
+    awaiting = sess.get("awaiting")
+    raw_state = getattr(conversation, "state", None)
+    conv_state = (
+        raw_state.value if raw_state is not None and hasattr(raw_state, "value") else raw_state
+    )
+    if not awaiting and not sess.get("doctor_id") and not sess.get("department_id") and not sess.get(
+        "selected_date"
+    ):
+        return None
+
+    step: dict = {}
+    if conv_state:
+        step["conv_state"] = str(conv_state)
+    if awaiting:
+        step["awaiting"] = str(awaiting)
+
+    doctor_id = sess.get("doctor_id")
+    if doctor_id:
+        doctor = doctor_service.get_doctor(db, int(doctor_id), clinic_id=DEFAULT_CLINIC_ID)
+        if doctor:
+            step["known_doctor"] = doctor.name_ar or doctor.name_en or str(doctor_id)
+
+    selected_date = sess.get("selected_date")
+    if selected_date:
+        step["known_date"] = str(selected_date)
+
+    department_id = sess.get("department_id")
+    if department_id:
+        dept = doctor_service.find_department(
+            db, DEFAULT_CLINIC_ID, department_id=int(department_id)
+        )
+        if dept:
+            step["known_specialty"] = dept.name_ar or dept.name_en or str(department_id)
+
+    return step or None
+
+
+def _voice_unclear_body(lang: str, awaiting: str | None) -> str:
+    """Targeted follow-up when voice cannot be resolved (Task E)."""
+    if awaiting == "slot":
+        return i18n.webhook_voice_unclear_slot(lang)
+    if awaiting == "doctor":
+        return i18n.webhook_voice_unclear_doctor(lang)
+    if awaiting == "date":
+        return i18n.webhook_voice_unclear_date(lang)
+    if awaiting == "department":
+        return i18n.webhook_voice_unclear_department(lang)
+    return i18n.webhook_voice_unclear(lang)
+
+
+def _reshow_last_options(phone: str, body: str, options: list, *, lang: str = "ar") -> None:
+    """Re-prompt with the open list/buttons alongside an unclear message."""
+    from app.services import whatsapp_client as wa
+
+    if not options:
+        wa.send_text(phone, body)
+        return
+    if len(options) <= 3:
+        buttons = [
+            {"id": str(o.get("id") or ""), "title": str(o.get("title") or o.get("id") or "")[:20]}
+            for o in options[:3]
+        ]
+        wa.send_buttons(phone, body, buttons)
+    else:
+        rows = [
+            {
+                "id": str(o.get("id") or ""),
+                "title": str(o.get("title") or o.get("id") or "")[:24],
+                "description": str(o.get("description") or "")[:72],
+            }
+            for o in options[:10]
+        ]
+        button_label = "Choose" if i18n.is_english(lang) else "اختر"
+        wa.send_list(phone, body=body, button_label=button_label, rows=rows)
+    # Keep mapping ids available for the next typed/spoken reply
+    sess = _sess(phone)
+    sess["last_options"] = list(options)
+
+
 def _handle_voice(phone: str, media_id: str | None) -> None:
     """Audio layer: Whisper+GPT route, then GitHub booking engine."""
     from app.services import voice_fastpath, voice_service, whatsapp_client as wa
@@ -122,14 +206,6 @@ def _handle_voice(phone: str, media_id: str | None) -> None:
 
         sess = _sess(phone)
         options = list(sess.get("last_options") or [])
-        result = voice_service.route_whatsapp_voice_message(media_id, options=options)
-        transcript = (result.get("transcript") or result.get("text") or "").strip()
-        confidence = float(result.get("confidence") or 0)
-        intent = (result.get("intent") or "unknown").strip().lower()
-        action = (result.get("action") or "clarify").strip().lower()
-        summary = (result.get("summary_ar") or "").strip()
-        option_id = result.get("selected_option_id")
-
         conversation = get_or_create_conversation(
             db,
             tenant_id=DEFAULT_TENANT_ID,
@@ -137,6 +213,28 @@ def _handle_voice(phone: str, media_id: str | None) -> None:
             phone=phone,
         )
         lang = get_conversation_language(conversation, sess)
+        current_step = _voice_current_step(db, sess, conversation)
+
+        result = voice_service.route_whatsapp_voice_message(
+            media_id,
+            options=options,
+            current_step=current_step,
+            db=db,
+            clinic_id=DEFAULT_CLINIC_ID,
+        )
+        transcript = (result.get("transcript") or result.get("text") or "").strip()
+        confidence = float(result.get("confidence") or 0)
+        intent = (result.get("intent") or "unknown").strip().lower()
+        action = (result.get("action") or "clarify").strip().lower()
+        summary = (result.get("summary_ar") or "").strip()
+        option_id = result.get("selected_option_id")
+        cost = result.get("cost") or None
+        duration_sec = (
+            int(round(cost["stt_seconds"]))
+            if cost and cost.get("stt_seconds")
+            else None
+        )
+
         msg = log_message(
             db,
             conversation_id=conversation.conversation_id,
@@ -152,11 +250,38 @@ def _handle_voice(phone: str, media_id: str | None) -> None:
             transcript=transcript or None,
             stt_provider=result.get("stt_provider"),
             confidence=confidence,
+            duration_sec=duration_sec,
         )
+        log_voice_call_cost(
+            db,
+            tenant_id=DEFAULT_TENANT_ID,
+            clinic_id=DEFAULT_CLINIC_ID,
+            cost=cost,
+        )
+
+        # Switch the conversation to the language actually spoken, so replies
+        # (engine i18n + fastpath text) come back in the caller's language.
+        # Only ar/en are actionable; mixed/unknown keep the current language.
+        understanding = result.get("understanding")
+        voice_lang = (
+            understanding.base_language() if understanding is not None else None
+        )
+        if voice_lang in ("ar", "en"):
+            from app.language.language_service import LanguageService
+
+            lang = LanguageService(db, conversation, sess).set_language(voice_lang)
         db.commit()
 
         awaiting = sess.get("awaiting")
-        if awaiting in {"patient_name", "mrn_value", "dob_value"} and transcript:
+        if (
+            awaiting in {"patient_name", "mrn_value", "dob_value"}
+            and transcript
+            and not voice_fastpath.voice_wants_flow_switch(result)
+        ):
+            # Normal case: the spoken reply is the answer (their name / MRN / DOB).
+            # If instead they voiced a *different* request (a new reservation,
+            # cancel, etc.), skip this capture and let the router below switch
+            # flows rather than forcing the sentence in as their name.
             process_incoming_message(
                 db,
                 phone=phone,
@@ -166,12 +291,8 @@ def _handle_voice(phone: str, media_id: str | None) -> None:
             )
             return
 
-        if (action == "clarify" or confidence < 0.5) and not (
-            action == "select_option" and option_id
-        ):
-            wa.send_text(phone, i18n.webhook_voice_unclear(lang))
-            return
-
+        # Let fastpath try first — do not gate on action/confidence here.
+        # clarify + usable hints (bare time, doctor fragment, etc.) must reach midflow.
         if voice_fastpath.try_voice_smart_route(db, phone=phone, result=result):
             return
 
@@ -185,7 +306,13 @@ def _handle_voice(phone: str, media_id: str | None) -> None:
             )
             return
 
-        if transcript:
+        # Any clean transcript that GPT didn't explicitly flag as "clarify"
+        # goes to the normal text engine, which handles greetings, MENU,
+        # booking words, and its own graceful fallback. Do NOT gate on the
+        # router's confidence here: a valid greeting scores conf=0.0 because
+        # it isn't a booking action, and gating on it dropped real speech
+        # into the generic "didn't understand" reply.
+        if transcript and action != "clarify":
             process_incoming_message(
                 db,
                 phone=phone,
@@ -195,7 +322,26 @@ def _handle_voice(phone: str, media_id: str | None) -> None:
             )
             return
 
-        wa.send_text(phone, i18n.webhook_voice_unclear(lang))
+        # GPT said "clarify". If we're NOT mid-flow, a clean transcript should
+        # still reach the engine (it opens the menu for greetings/unknown text)
+        # instead of a dead-end. Mid-flow (awaiting set) keeps the targeted
+        # fallback below so we can re-ask the specific question.
+        if transcript and not awaiting:
+            process_incoming_message(
+                db,
+                phone=phone,
+                text=transcript,
+                payload_id=None,
+                message_type="text",
+            )
+            return
+
+        _reshow_last_options(
+            phone,
+            _voice_unclear_body(lang, awaiting if isinstance(awaiting, str) else None),
+            options,
+            lang=lang,
+        )
     except Exception:
         _log("[webhook] ERROR while handling voice:")
         traceback.print_exc()

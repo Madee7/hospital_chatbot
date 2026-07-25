@@ -896,6 +896,57 @@ def continue_after_doctor_selected(
     db.commit()
 
 
+def _slot_rows_with_change_day(day_slots: list[dict], lang: str | None) -> list[dict[str, str]]:
+    """Time-slot rows plus a trailing 'change the day' row (list capped at 10)."""
+    rows = _slot_list_rows(day_slots, lang)[:9]
+    rows.append(
+        {
+            "id": "change_day",
+            "title": i18n.change_day_row_title(lang),
+            "description": "",
+        }
+    )
+    return rows
+
+
+def _reshow_booking_dates(phone: str, db: Session, conversation) -> bool:
+    """Send the day picker again (used when the patient wants to change the day
+    from the time-slot step, via a button or a voice request). Returns True when
+    handled."""
+    sess = _sess(phone)
+    lang = _lang(conversation, sess)
+    doctor_id = sess.get("doctor_id")
+    if not doctor_id:
+        return False
+    booking_service.release_expired_holds(db, clinic_id=DEFAULT_CLINIC_ID)
+    avail = booking_service.get_available_dates_and_slots(
+        db, doctor_id=int(doctor_id), clinic_id=DEFAULT_CLINIC_ID
+    )
+    dates = list(avail.get("dates", {}).keys())
+    if not dates:
+        _offer_buttons(
+            phone,
+            i18n.no_slots_for_doctor(lang),
+            i18n.no_slots_alt_buttons(lang),
+        )
+        sess["awaiting"] = "no_slots_alt"
+        db.commit()
+        return True
+    set_conversation_state(
+        db, conversation, ConversationState.BOOKING_DATE, current_intent="booking_date"
+    )
+    sess["awaiting"] = None
+    _offer_list(
+        phone,
+        body=i18n.choose_day(lang),
+        button_label=i18n.days_button_label(lang),
+        rows=_date_list_rows(dates, lang),
+        section_title=i18n.dates_section_title(lang),
+    )
+    db.commit()
+    return True
+
+
 def node_persist_inbound(state: GraphState) -> GraphState:
     db: Session = state["db_session"]
     phone = state["phone"]
@@ -1141,9 +1192,25 @@ def node_handle(state: GraphState) -> GraphState:
             wa.send_text(phone, i18n.thanks_ack(lang))
             return {**state, "handled": True}
 
-        # Greeting / menu intent / any free-text start while idle → open menu.
-        # Clear book/update/cancel/inquiry already routed above via rules+LLM.
-        if intent == Intent.MENU or (text or choice).strip():
+        # Greeting / explicit menu intent while idle → open the menu as a
+        # welcome (no apology; greetings are classified as Intent.MENU).
+        if intent == Intent.MENU:
+            _send_main_menu(phone, db, conversation)
+            return {**state, "handled": True}
+
+        # A leftover interactive tap (an old date/slot/doctor button the patient
+        # taps after the flow already moved on, or after returning to the menu):
+        # don't re-dump the whole menu — that reads as the menu "popping up
+        # twice" / the bot glitching. A short nudge is enough.
+        if payload_id:
+            wa.send_text(phone, i18n.stale_option_hint(lang))
+            return {**state, "handled": True}
+
+        # Any other unrecognized free-text while idle → acknowledge we didn't
+        # understand BEFORE showing the menu, so it doesn't feel like the menu
+        # popped up at random (common after an unclear voice note).
+        if (text or choice).strip():
+            wa.send_text(phone, i18n.not_understood_menu(lang))
             _send_main_menu(phone, db, conversation)
         return {**state, "handled": True}
 
@@ -1315,7 +1382,7 @@ def node_handle(state: GraphState) -> GraphState:
             phone,
             body=i18n.choose_slot_on_date(lang, date_label),
             button_label=i18n.times_button_label(lang),
-            rows=_slot_list_rows(day_slots, lang),
+            rows=_slot_rows_with_change_day(day_slots, lang),
             section_title=i18n.slots_section_title(lang),
         )
         db.commit()
@@ -1324,6 +1391,10 @@ def node_handle(state: GraphState) -> GraphState:
     # ---- Slot hold ----
     if conv_state == ConversationState.BOOKING_SLOT.value:
         if _sess_missing(phone, db, conversation, "doctor_id"):
+            return {**state, "handled": True}
+        # "Change the day" from the time list → re-open the day picker.
+        if choice == "change_day" or text == "change_day":
+            _reshow_booking_dates(phone, db, conversation)
             return {**state, "handled": True}
         if not choice.startswith("slot_"):
             wa.send_text(phone, i18n.choose_time_from_list(_lang(conversation)))

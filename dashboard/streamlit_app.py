@@ -236,7 +236,11 @@ def page_kpis(db, clinic_id: int) -> None:
     c9.metric(_ui("voice_notes"), k["voice_usage_count"])
     c10.metric(_ui("voice_minutes"), k["voice_usage_minutes"])
     c11.metric(_ui("handover_open"), k["handover_open"])
-    c12.metric(_ui("est_cost"), f"{k['estimated_cost']:.4f}")
+    c12.metric(_ui("est_cost"), f"${k['estimated_cost']:.4f}")
+
+    c13, c14, _, _ = st.columns(4)
+    c13.metric(_ui("voice_cost"), f"${k.get('voice_estimated_cost', 0.0):.4f}")
+    c14.metric(_ui("voice_cost_avg"), f"${k.get('voice_cost_avg', 0.0):.4f}")
 
     left, right = st.columns(2)
     with left:

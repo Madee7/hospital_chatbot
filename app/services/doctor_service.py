@@ -58,6 +58,39 @@ def _norm_ar(text: str) -> str:
     return re.sub(r"\s+", " ", s)
 
 
+def _strip_al(token: str) -> str:
+    """Drop the Arabic definite article 'ال' so 'الأسنان' matches 'أسنان'."""
+    if token.startswith("ال") and len(token) > 3:
+        return token[2:]
+    return token
+
+
+def _word_match(blob: str | None, needle: str | None) -> bool:
+    """Whole-word / phrase containment on normalized text.
+
+    Respects word boundaries so a short specialty alias can't match *inside*
+    an unrelated word — e.g. the alias 'سن' (tooth) must NOT match inside the
+    doctor name 'حسن' (Hassan), which previously misrouted a 'Dr. Dina Hassan'
+    booking to the dental department. Tolerates the Arabic definite article
+    ('ال') so 'الأسنان' still matches the alias 'أسنان'.
+    """
+    b = _norm_ar(blob or "")
+    n = _norm_ar(needle or "")
+    if not b or not n:
+        return False
+    if f" {n} " in f" {b} ":
+        return True
+
+    b_tokens = [_strip_al(t) for t in b.split(" ") if t]
+    n_tokens = [_strip_al(t) for t in n.split(" ") if t]
+    if not b_tokens or not n_tokens:
+        return False
+    for i in range(len(b_tokens) - len(n_tokens) + 1):
+        if b_tokens[i : i + len(n_tokens)] == n_tokens:
+            return True
+    return False
+
+
 def list_departments(db: Session, clinic_id: int) -> list[Department]:
     return (
         db.query(Department)
@@ -112,13 +145,12 @@ def find_department(
         if cleaned in candidates:
             return dept
 
-    # Alias table (قلب → Cardiology, etc.)
+    # Alias table (قلب → Cardiology, etc.) — whole-word match only
     for _canonical, aliases in _SPECIALTY_ALIASES.items():
-        alias_norms = {_norm_ar(a) for a in aliases}
-        if cleaned in alias_norms or any(a and a in cleaned for a in alias_norms):
+        if any(_word_match(cleaned, a) for a in aliases):
             for dept in departments:
                 blob = _dept_blob(dept)
-                if any(a in blob for a in alias_norms if len(a) >= 2):
+                if any(_word_match(blob, a) for a in aliases):
                     return dept
 
     # Soft containment (min 2 chars for Arabic specialty words like قلب)
@@ -126,7 +158,7 @@ def find_department(
         return None
     for dept in departments:
         blob = _dept_blob(dept)
-        if blob and (cleaned in blob or blob in cleaned):
+        if blob and (_word_match(blob, cleaned) or _word_match(cleaned, blob)):
             return dept
     return None
 
@@ -148,13 +180,11 @@ def infer_department_from_text(
     )
     for dept in departments:
         for label in (dept.name_ar, dept.name_en):
-            n = _norm_ar(label or "")
-            if len(n) >= 2 and n in blob:
+            if _word_match(blob, label):
                 return dept
     for aliases in _SPECIALTY_ALIASES.values():
         for alias in aliases:
-            n = _norm_ar(alias)
-            if len(n) >= 2 and n in blob:
+            if _word_match(blob, alias):
                 found = find_department(db, clinic_id, name=alias)
                 if found:
                     return found

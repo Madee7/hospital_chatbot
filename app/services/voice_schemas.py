@@ -28,6 +28,21 @@ VoiceActionLiteral = Literal[
     "clarify",
 ]
 
+# Extended language codes the router may emit; folded to ar/en/mixed/unknown
+# for downstream use via VoiceUnderstanding.base_language().
+VoiceLanguageLiteral = Literal[
+    "ar",
+    "ar-EG",
+    "en",
+    "en-US",
+    "en-GB",
+    "mixed",
+    "unknown",
+]
+
+# Edit/update flow: which part of an existing appointment to change.
+VoiceChangeTargetLiteral = Literal["doctor", "date", "time"]
+
 _CONF_WORDS = {
     "very high": 0.95,
     "high": 0.9,
@@ -57,7 +72,11 @@ class VoiceUnderstanding(BaseModel):
         description="Appointment time like 16:30 or 4:30 PM if spoken.",
     )
     summary_ar: str = Field(default="")
-    language: Literal["ar", "en", "mixed", "unknown"] = Field(default="ar")
+    language: VoiceLanguageLiteral = Field(default="ar")
+    change_target: Optional[VoiceChangeTargetLiteral] = Field(
+        default=None,
+        description="For edit/update: which part to change (doctor/date/time).",
+    )
 
     @field_validator("intent", mode="before")
     @classmethod
@@ -127,6 +146,60 @@ class VoiceUnderstanding(BaseModel):
             return None
         s = str(v).strip()
         return s or None
+
+    @field_validator("language", mode="before")
+    @classmethod
+    def _coerce_language(cls, v: Any) -> str:
+        if v is None or v == "":
+            return "ar"
+        s = str(v).strip().lower().replace("_", "-")
+        mapping = {
+            "ar": "ar",
+            "arabic": "ar",
+            "ar-eg": "ar-EG",
+            "arz": "ar-EG",
+            "egyptian": "ar-EG",
+            "en": "en",
+            "english": "en",
+            "en-us": "en-US",
+            "en-gb": "en-GB",
+            "mixed": "mixed",
+            "unknown": "unknown",
+        }
+        return mapping.get(s, "ar")
+
+    @field_validator("change_target", mode="before")
+    @classmethod
+    def _coerce_change_target(cls, v: Any) -> str | None:
+        if v is None or v == "":
+            return None
+        s = str(v).strip().lower()
+        mapping = {
+            "doctor": "doctor",
+            "physician": "doctor",
+            "طبيب": "doctor",
+            "دكتور": "doctor",
+            "date": "date",
+            "day": "date",
+            "يوم": "date",
+            "تاريخ": "date",
+            "time": "time",
+            "slot": "time",
+            "وقت": "time",
+            "ميعاد": "time",
+        }
+        return mapping.get(s, None)
+
+    def base_language(self) -> str:
+        """Fold regional codes (ar-EG/en-US…) to ar/en/mixed/unknown."""
+        s = (self.language or "").lower()
+        if s.startswith("ar"):
+            return "ar"
+        if s.startswith("en"):
+            return "en"
+        if s == "mixed":
+            return "mixed"
+        return "unknown"
 
     def as_intent(self) -> Intent:
         try:

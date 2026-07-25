@@ -14,6 +14,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.core import i18n_bot as i18n
 from app.core.config import DEFAULT_CLINIC_ID, DEFAULT_TENANT_ID, SLOT_HOLD_MINUTES
 from app.db.enums import ConversationState
 from app.graph.conversation_engine import _sess
@@ -51,6 +52,29 @@ _OPTION_AWAITING = {
     "post_cancel",
 }
 
+# Public aliases for voice_service CURRENT_STEP templates (keep in sync)
+VOICE_FREE_TEXT_AWAITING = _FREE_TEXT_AWAITING
+VOICE_OPTION_AWAITING = _OPTION_AWAITING
+
+
+def voice_wants_flow_switch(result: dict[str, Any]) -> bool:
+    """True when a voice reply given during a free-text step (name / MRN / DOB)
+    is really a *different* request — a new booking, reschedule, cancel,
+    doctor/specialty jump, or staff handover — and should switch flows instead
+    of being stored as the name/MRN/DOB answer.
+
+    Plain answers (an actual name) come back as intent=unknown / action=clarify
+    with no booking signal, so they are NOT treated as a switch.
+    """
+    action = (result.get("action") or "").strip().lower()
+    intent = (result.get("intent") or "").strip().lower()
+    conf = float(result.get("confidence") or 0)
+    if action in {"book_direct", "specialty_direct"}:
+        return True
+    if intent in {"book", "update", "cancel", "ask_doctors", "handover"} and conf >= 0.6:
+        return True
+    return False
+
 _WEEKDAY_AR = {
     "الاثنين": 0,
     "الاتنين": 0,
@@ -80,11 +104,54 @@ _AR_DIGIT_TRANS = str.maketrans(
 _DAYTIME_BARE_HOURS = range(1, 8)
 
 
+def _reply_lang(phone: str) -> str:
+    """Reply language for direct fastpath messages (session-mirrored)."""
+    return i18n.normalize_lang(_sess(phone).get("language") or "ar")
+
+
 def _norm_ar(text: str) -> str:
     s = (text or "").strip().lower()
     for src, dst in (("أ", "ا"), ("إ", "ا"), ("آ", "ا"), ("ة", "ه"), ("ى", "ي")):
         s = s.replace(src, dst)
     return re.sub(r"\s+", " ", s)
+
+
+_CHANGE_DAY_PHRASES = (
+    # Arabic (normalized via _norm_ar: hamza/ta-marbuta/alef-maqsura folded)
+    "غير اليوم",
+    "غير التاريخ",
+    "غير الميعاد",
+    "تغيير اليوم",
+    "تغيير التاريخ",
+    "بدل اليوم",
+    "يوم تاني",
+    "يوم اخر",
+    "يوم غير",
+    "تاريخ تاني",
+    "تاريخ اخر",
+    "معاد تاني",
+    "اعدل اليوم",
+    "عدل اليوم",
+    # English
+    "change day",
+    "change the day",
+    "change date",
+    "change the date",
+    "another day",
+    "other day",
+    "different day",
+    "another date",
+    "different date",
+)
+
+
+def _wants_change_day(result: dict[str, Any], transcript: str) -> bool:
+    """True when a voice reply at the time-slot step asks to change the day/date
+    rather than pick a time (e.g. 'عايز أغير اليوم' / 'change the day')."""
+    if (result.get("change_target") or "").strip().lower() == "date":
+        return True
+    n = _norm_ar(transcript)
+    return any(p in n for p in _CHANGE_DAY_PHRASES)
 
 
 def _state_value(conversation) -> str:
@@ -500,10 +567,100 @@ def try_voice_midflow(
         logger.info(f"[voice_fast] midflow → menu phone={phone}")
         return _dispatch(db, phone, text="القائمة")
 
+    # A *different* request voiced during a free-text step (e.g. the patient
+    # asks to book a new reservation while we're waiting for their name):
+    # abandon the half-finished flow and honor the new request rather than
+    # storing the whole sentence as the name/MRN/DOB.
+    if awaiting in _FREE_TEXT_AWAITING and transcript and voice_wants_flow_switch(result):
+        logger.info(
+            "[voice_fast] midflow free-text → switch flow awaiting=%s action=%s "
+            "intent=%s conf=%.2f doctor=%r specialty=%r phone=%s",
+            awaiting,
+            action,
+            intent,
+            confidence,
+            result.get("doctor_hint"),
+            result.get("specialty_hint"),
+            phone,
+        )
+        from app.graph.conversation_engine import _clear_draft
+        from app.services.conversation_service import set_conversation_state
+
+        _clear_draft(phone)
+        set_conversation_state(
+            db,
+            conversation,
+            ConversationState.MAIN_MENU,
+            current_intent="voice_flow_switch",
+        )
+        db.commit()
+        if try_voice_book_direct(db, phone=phone, result=result):
+            return True
+        if try_voice_specialty_direct(db, phone=phone, result=result):
+            return True
+        if try_voice_menu_intent(db, phone=phone, result=result):
+            return True
+        # Couldn't start a concrete flow (e.g. named doctor not found): seed the
+        # intent's flow so we don't loop on the name prompt.
+        seed = {
+            "book": "حجز موعد",
+            "update": "تعديل موعد",
+            "cancel": "إلغاء موعد",
+            "ask_doctors": "الاستفسار عن الأطباء",
+            "handover": "التحدث مع موظف",
+        }.get(intent)
+        return _dispatch(db, phone, text=seed or "القائمة")
+
     # Free-text capture (name / MRN / DOB) — never divert to specialty
     if awaiting in _FREE_TEXT_AWAITING and transcript:
         logger.info(f"[voice_fast] midflow free-text awaiting={awaiting} phone={phone}")
         return _dispatch(db, phone, text=transcript)
+
+    # A clearly *different* booking voiced while reviewing the summary / confirm
+    # step: the patient named a NEW doctor or specialty (e.g. "أحجز مع دكتور دينا
+    # حسن يوم الاتنين"). Abandon the half-finished draft and start the new booking
+    # instead of letting the confirm/cancel matcher swallow the word "أحجز".
+    # Gated on a concrete doctor/specialty hint so a plain "نعم"/"احجز" can never
+    # hijack a genuine confirmation.
+    if (
+        (
+            awaiting in {"summary", "confirm"}
+            or conv_state == ConversationState.CONFIRMING.value
+        )
+        and transcript
+        and (result.get("doctor_hint") or result.get("specialty_hint"))
+        and voice_wants_flow_switch(result)
+    ):
+        logger.info(
+            "[voice_fast] midflow confirm → switch flow awaiting=%s action=%s "
+            "intent=%s conf=%.2f doctor=%r specialty=%r phone=%s",
+            awaiting,
+            action,
+            intent,
+            confidence,
+            result.get("doctor_hint"),
+            result.get("specialty_hint"),
+            phone,
+        )
+        from app.graph.conversation_engine import _clear_draft
+        from app.services.conversation_service import set_conversation_state
+
+        _clear_draft(phone)
+        set_conversation_state(
+            db,
+            conversation,
+            ConversationState.MAIN_MENU,
+            current_intent="voice_flow_switch",
+        )
+        db.commit()
+        if try_voice_book_direct(db, phone=phone, result=result):
+            return True
+        if try_voice_specialty_direct(db, phone=phone, result=result):
+            return True
+        # Named target couldn't be started → open the relevant flow rather than
+        # silently confirming the old draft.
+        seed = {"book": "حجز موعد", "cancel": "إلغاء موعد"}.get(intent, "القائمة")
+        return _dispatch(db, phone, text=seed)
 
     # Confirm / skip gates
     if awaiting in {"summary", "confirm", "mrn_optional", "dob_gate"} or conv_state in {
@@ -567,7 +724,9 @@ def try_voice_midflow(
             sess["awaiting"] = "doctor"
             wa.send_text(
                 phone,
-                f"حسناً — تخصص {dept.name_ar or dept.name_en}. افتح قائمة الأطباء:",
+                i18n.voice_specialty_open_doctors(
+                    _reply_lang(phone), dept.name_ar or dept.name_en or ""
+                ),
             )
             return bool(
                 _show_doctor_cards(phone, db, dept.department_id)
@@ -611,6 +770,11 @@ def try_voice_midflow(
 
     # Slot / time step
     if conv_state == ConversationState.BOOKING_SLOT.value or awaiting == "slot":
+        # "عايز أغير اليوم" / "change the day" → re-open the day picker instead
+        # of trying to match a time.
+        if _wants_change_day(result, transcript):
+            logger.info(f"[voice_fast] midflow slot → change day phone={phone}")
+            return _dispatch(db, phone, text="change_day", payload_id="change_day")
         time_hint = result.get("time_hint") or transcript
         doctor_id = sess.get("doctor_id")
         selected_date = sess.get("selected_date")
@@ -647,9 +811,19 @@ def try_voice_midflow(
 
     # Reschedule change type
     if awaiting == "change_type":
+        # Prefer the router's explicit change_target when present.
+        target = (result.get("change_target") or "").strip().lower()
+        if target == "doctor":
+            return _dispatch(db, phone, text="تغيير الطبيب")
+        if target == "date":
+            return _dispatch(db, phone, text="تغيير اليوم")
+        if target == "time":
+            return _dispatch(db, phone, text="تغيير الوقت")
         n = _norm_ar(transcript)
         if "طبيب" in n or "doctor" in n:
             return _dispatch(db, phone, text="تغيير الطبيب")
+        if "يوم" in n or "تاريخ" in n or "day" in n or "date" in n:
+            return _dispatch(db, phone, text="تغيير اليوم")
         if "وقت" in n or "ميعاد" in n or "time" in n:
             return _dispatch(db, phone, text="تغيير الوقت")
         if "رجوع" in n or "قائمه" in n or "menu" in n:
@@ -801,7 +975,7 @@ def try_voice_book_direct(
             _date_option_title,
             _lang,
             _offer_list,
-            _slot_list_rows,
+            _slot_rows_with_change_day,
         )
 
         day_slots = dates.get(date_key) or []
@@ -817,10 +991,10 @@ def try_voice_book_direct(
             date_label = _date_option_title(date_key, lang)
             _offer_list(
                 phone,
-                body=f"اختر موعداً لمدة 30 دقيقة بتاريخ {date_label}:",
-                button_label="الأوقات",
-                rows=_slot_list_rows(day_slots, lang),
-                section_title="المواعيد",
+                body=i18n.choose_slot_on_date(lang, date_label),
+                button_label=i18n.times_button_label(lang),
+                rows=_slot_rows_with_change_day(day_slots, lang),
+                section_title=i18n.slots_section_title(lang),
             )
             db.commit()
             logger.info(
@@ -841,7 +1015,7 @@ def try_voice_book_direct(
         time_hint,
         _normalize_date_hint(date_hint),
     )
-    wa.send_text(phone, f"حسناً — متابعة الحجز مع {doctor_name}.")
+    wa.send_text(phone, i18n.voice_continue_with_doctor(_reply_lang(phone), doctor_name))
     continue_after_doctor_selected(db, phone=phone, doctor_id=doctor.doctor_id)
     return True
 
@@ -909,8 +1083,13 @@ def try_voice_specialty_direct(
 
     from app.graph.conversation_engine import _show_doctor_cards
 
-    dept_name = dept.name_ar or dept.name_en or "التخصص"
-    wa.send_text(phone, f"حسناً — تخصص {dept_name}. افتح قائمة الأطباء:")
+    _lng = _reply_lang(phone)
+    dept_name = (
+        (dept.name_en or dept.name_ar)
+        if i18n.is_english(_lng)
+        else (dept.name_ar or dept.name_en)
+    ) or ""
+    wa.send_text(phone, i18n.voice_specialty_open_doctors(_lng, dept_name))
     ok = _show_doctor_cards(
         phone,
         db,
