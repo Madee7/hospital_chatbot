@@ -1088,6 +1088,29 @@ def slots_section_title(lang: Any) -> str:
     return "Slots" if is_english(lang) else "المواعيد"
 
 
+def change_day_row_title(lang: Any) -> str:
+    """List row shown under the time slots to jump back and pick another day."""
+    return "Change the day" if is_english(lang) else "تغيير اليوم"
+
+
+def change_day_section_title(lang: Any) -> str:
+    return "Options" if is_english(lang) else "خيارات"
+
+
+def voice_specialty_open_doctors(lang: Any, dept_name: str) -> str:
+    """Voice fastpath transition when jumping to a specialty's doctor list."""
+    if is_english(lang):
+        return f"Sure — {dept_name}. Opening the list of doctors:"
+    return f"حسناً — تخصص {dept_name}. افتح قائمة الأطباء:"
+
+
+def voice_continue_with_doctor(lang: Any, doctor_name: str) -> str:
+    """Voice fastpath transition when continuing a booking with a chosen doctor."""
+    if is_english(lang):
+        return f"Sure — continuing your booking with {doctor_name}."
+    return f"حسناً — متابعة الحجز مع {doctor_name}."
+
+
 def no_slots_on_day(lang: Any) -> str:
     if is_english(lang):
         return "No times on that day. Please choose another day."
@@ -1519,6 +1542,58 @@ def webhook_voice_unclear(lang: Any) -> str:
     if is_english(lang):
         return "I didn't catch the voice note clearly. Please record again or type your request."
     return "لم أفهم الرسالة الصوتية بوضوح. أعد التسجيل أو اكتب طلبك نصاً."
+
+
+def not_understood_menu(lang: Any) -> str:
+    """Short acknowledgment shown just before the main menu when idle input
+    couldn't be understood, so the menu doesn't appear to pop up at random."""
+    if is_english(lang):
+        return "Sorry, I didn't quite catch that. Here's what I can help with:"
+    return "معلش، مفهمتش قصدك بالظبط. دي الخدمات اللي أقدر أساعدك فيها:"
+
+
+def stale_option_hint(lang: Any) -> str:
+    """Nudge for a leftover button/list tap that no longer fits the current
+    step — a gentle one-liner instead of re-dumping the whole menu."""
+    if is_english(lang):
+        return "That option isn't active anymore. Please pick from the latest message, or type MENU."
+    return "هذا الاختيار لم يعد متاحاً. اختر من آخر رسالة، أو اكتب MENU."
+
+
+def webhook_voice_unclear_slot(lang: Any) -> str:
+    if is_english(lang):
+        return (
+            "I didn't catch the time you wanted — "
+            "please say the hour again, or pick from the list."
+        )
+    return "لم أفهم الوقت المطلوب — ممكن تقول الساعة تاني، أو تختار من القائمة؟"
+
+
+def webhook_voice_unclear_doctor(lang: Any) -> str:
+    if is_english(lang):
+        return (
+            "I didn't recognize the doctor's name — "
+            "try again, or choose from the list."
+        )
+    return "لم أتعرف على اسم الدكتور — جرب تاني أو اختر من القائمة."
+
+
+def webhook_voice_unclear_date(lang: Any) -> str:
+    if is_english(lang):
+        return (
+            "I didn't catch the day you wanted — "
+            "please say the day again, or pick from the list."
+        )
+    return "لم أفهم اليوم المطلوب — ممكن تقول اليوم تاني، أو تختار من القائمة؟"
+
+
+def webhook_voice_unclear_department(lang: Any) -> str:
+    if is_english(lang):
+        return (
+            "I didn't catch the specialty — "
+            "please say it again, or choose from the list."
+        )
+    return "لم أفهم التخصص المطلوب — ممكن تعيده تاني، أو تختار من القائمة؟"
 
 
 def webhook_voice_confirm_prompt(lang: Any, transcript: str) -> str:

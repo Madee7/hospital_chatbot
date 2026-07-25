@@ -13,8 +13,10 @@ from typing import Any, Callable, TypeVar
 import openai
 import requests
 from openai import OpenAI
+from sqlalchemy.orm import Session
 
 from app.core.config import (
+    DEFAULT_CLINIC_ID,
     OPENAI_API_KEY,
     OPENAI_MODEL,
     OPENAI_STT_MODEL,
@@ -26,32 +28,234 @@ from app.services.voice_schemas import VoiceUnderstanding
 # TODO: prefer DB-driven matching via doctor_service.infer_department_from_text(clinic_id)
 # once a Session/clinic_id is threaded into _sanitize (option b). For now aliases stay
 # in doctor_service._SPECIALTY_ALIASES as the single source of truth.
-from app.services.doctor_service import is_specialty_word
+from app.services import voice_cost
+from app.services.doctor_service import is_specialty_word, specialty_alias_words
 
 logger = logging.getLogger(__name__)
 
 Option = dict[str, Any]
 T = TypeVar("T")
 
-_SYSTEM = (
-    "You are the router for a hospital WhatsApp chatbot "
-    "(New Giza University Hospital). Patients speak Egyptian Arabic. "
-    "Given a Whisper transcript AND optional current WhatsApp options (may be mid-booking), "
-    "choose ONE action:\n"
-    "- select_option: patient clearly picks a listed option OR says a number/title matching one "
-    "→ set selected_option_id to that exact id (preferred when OPTIONS_JSON is non-empty)\n"
-    "- book_direct: wants to book AND mentions a PERSON's doctor name (رانيا، أحمد سمير…) "
-    "→ doctor_hint = person name only; fill date_hint as YYYY-MM-DD when possible "
-    "(resolve بكرة/غداً/النهاردة/weekday to a real date if you can) and time_hint if spoken\n"
-    "- specialty_direct: specialty/department WITHOUT a person name "
-    "('دكتور قلب', 'عايز قلب', 'حجز عظام') → specialty_hint only; never put تخصص in doctor_hint\n"
-    "- intent: book/update/cancel/ask_doctors/handover/menu/confirm when starting or escaping; "
-    "confirm=تأكيد/نعم while confirming a booking\n"
-    "- clarify: unclear\n"
-    "If OPTIONS_JSON has date_* or slot_* rows, prefer select_option.\n"
-    "Always extract doctor_hint, specialty_hint, date_hint, time_hint when mentioned. "
-    "confidence MUST be a number 0-1. Never invent option ids. Keep transcript Arabic."
-)
+# In-process Whisper vocabulary prompt cache: clinic_id → (expires_at, prompt)
+_STT_PROMPT_CACHE: dict[int, tuple[float, str]] = {}
+_STT_PROMPT_TTL_SEC = 600.0  # 10 minutes
+_STT_PROMPT_MAX_CHARS = 800
+
+_SYSTEM = """You are an intelligent router for New Giza University Hospital's WhatsApp chatbot.
+Patients speak Egyptian Arabic. Your job is to extract maximum information and route efficiently.
+
+========================================================================
+BOOKING FLOW OVERVIEW
+========================================================================
+Standard linear flow:
+1. Welcome -> Book intent
+2. Choose specialty OR doctor
+3. Choose date
+4. Choose time slot
+5. Provide full name
+6. Confirm booking
+
+SMART ROUTING: When patient provides multiple pieces at once, extract ALL and skip steps.
+
+========================================================================
+ACTION TYPES (choose exactly ONE)
+========================================================================
+
+- book_direct: Patient mentions a PERSON's name as doctor.
+  Examples: "احجز مع دكتور علي" / "عايز دكتور أحمد سمير بكرة" /
+            "موعد مع رانيا الساعة 2" / "احجز مع د. محمد يوم الأحد الصبح".
+  MUST FILL:
+    - doctor_hint: PERSON NAME ONLY (strip "دكتور", "د.", titles)
+    - date_hint: YYYY-MM-DD if a date is mentioned (see date rules)
+    - time_hint: if a time/period is mentioned (see time rules)
+    - intent: "book"
+    - confidence: 0.8-1.0 if doctor name is clear
+  DO NOT use if only a specialty is mentioned without a person name.
+
+- specialty_direct: Patient mentions a specialty/department WITHOUT a person name.
+  Examples: "عايز دكتور قلب" / "احجز في عظام بكرة" /
+            "موعد تخصص أطفال الساعة 3" / "دكتور باطنة".
+  MUST FILL:
+    - specialty_hint: department/specialty name (e.g. "قلب", "عظام")
+    - date_hint / time_hint if mentioned
+    - doctor_hint: MUST be null
+    - intent: "book"
+    - confidence: 0.7-1.0 if specialty is recognized
+  Specialty words: قلب، عظام، أطفال، نساء، جراحة، باطنة، أسنان، عيون.
+  "دكتور [specialty]" -> specialty, NOT a doctor name.
+
+- select_option: Patient picks from OPTIONS_JSON (by number or title).
+  Examples: "رقم 1" / "1" / "واحد" / exact title / "الخيار الأول".
+  MUST FILL:
+    - selected_option_id: exact id from OPTIONS_JSON
+    - confidence: 0.9+ if exact match
+  PRIORITY: If OPTIONS_JSON is non-empty and the response matches, prefer this
+  over other actions. selected_option_id MUST exist in OPTIONS_JSON. If a number
+  is said, match by position (1 = first option).
+
+- intent: Patient expresses a general intent without enough details.
+  intent values: book / update / cancel / ask_doctors / confirm / menu / handover.
+  Examples: "عايز احجز" -> book; "الغي الموعد" -> cancel; "نعم تمام" -> confirm;
+            "عايز اكلم حد" -> handover.
+  If the patient provides a doctor/specialty WITH the intent, use book_direct or
+  specialty_direct instead.
+
+- INQUIRY / AVAILABILITY questions (asking ABOUT doctors, specialties, or open
+  times rather than booking now): use intent="ask_doctors", confidence 0.6-0.9.
+  Examples: "مين الأطباء المتاحين؟" / "عايز أعرف مواعيد دكتور عمر خالد" /
+            "إيه المواعيد المتاحة لدكتور الأطفال؟" / "التخصصات المتاحة؟".
+  - If a specialty is named -> action="specialty_direct" (specialty_hint), intent="ask_doctors".
+  - If a doctor person name is named -> action="book_direct" (doctor_hint), intent="ask_doctors".
+  - Otherwise -> action="intent", intent="ask_doctors".
+  NEVER mark an answerable availability/info question as "clarify".
+
+- clarify: Input is unclear, ambiguous, or unintelligible (noise, incomplete,
+  cannot determine intent). Set confidence 0.0-0.4 and summary_ar explaining why.
+  AVOID OVERUSE: if CURRENT_STEP context makes the intent clear, or the patient is
+  clearly asking about doctors/availability, do NOT use clarify.
+
+========================================================================
+DATE PARSING RULES (always convert to YYYY-MM-DD)
+========================================================================
+TODAY={actual_date} (weekday={weekday_name}) is provided in the user message.
+All relative dates MUST be calculated from TODAY.
+
+Relative keywords:
+  النهاردة / اليوم  -> TODAY
+  بكرة / غداً       -> TODAY + 1 day
+  بعد بكرة          -> TODAY + 2 days
+  أمبارح / امس      -> TODAY - 1 day (past)
+
+Weekdays (الأحد/الإثنين/الثلاثاء/الأربعاء/الخميس/الجمعة/السبت) -> the NEXT
+occurrence of that weekday from TODAY.
+
+Examples (if TODAY = 2026-07-24, Friday):
+  "بكرة" -> 2026-07-25 ; "يوم الأحد" -> 2026-07-26 ; "الإثنين" -> 2026-07-27 ;
+  "النهاردة" -> 2026-07-24.
+OUTPUT FORMAT: always YYYY-MM-DD.
+
+========================================================================
+TIME PARSING RULES
+========================================================================
+Specific times:
+  2 / اتنين / الساعة 2 -> "14:00" (assume PM unless context says AM)
+  10 / عشرة            -> "10:00" (AM)
+  2:30 / اتنين ونص     -> "14:30"
+  3:15 / تلاتة وربع    -> "15:15"
+  5 المساء / 5 بليل    -> "17:00"
+  9 الصبح              -> "09:00"
+
+Time periods (store the keyword; system expands to slots):
+  الصبح / الصباح       -> "morning"   (~09:00-12:00)
+  بعد الضهر / الظهر    -> "afternoon" (~12:00-17:00)
+  المساء / بليل / الليل -> "evening"  (~17:00-20:00)
+  أي وقت / أي ميعاد    -> "any"
+
+Priority: specific time > period. "عايز موعد بكرة الصبح الساعة 10" -> time_hint="10:00".
+OUTPUT: specific times as "HH:MM" (24h); periods as morning/afternoon/evening/any.
+
+========================================================================
+CONTEXT-AWARE ROUTING (CURRENT_STEP intelligence)
+========================================================================
+CURRENT_STEP (when provided) means the patient is mid-booking. Fields:
+awaiting, known_doctor, known_specialty, known_date.
+
+1. COMPLETE THE CURRENT STEP FIRST.
+   awaiting="date" and user says "بكرة" -> date_hint="<tomorrow>"; do NOT treat as
+   unclear/new request; use select_option if a matching date_* is in OPTIONS_JSON.
+2. PRESERVE KNOWN CONTEXT.
+   known_doctor set and user says "الساعة 2" -> still carry doctor_hint and add
+   time_hint="14:00" for full booking context.
+3. DETECT CONTEXT CHANGES.
+   known_doctor="Ahmed" but user says "لا عايز دكتور علي" -> doctor_hint="علي",
+   action="book_direct", high confidence (clear change of mind).
+4. SHORT ANSWERS IN CONTEXT.
+   awaiting="confirm" + "نعم"/"موافق" -> action="intent", intent="confirm", conf≈0.95.
+   awaiting="slot" + "3"/"تلاتة" -> if it matches an option id, select_option; if no
+   slots shown, extract time_hint.
+5. MID-FLOW STEP AWARENESS (awaiting values):
+   - "department" -> choosing specialty; "قلب"/"عظام" -> specialty_hint.
+   - "doctor" -> choosing doctor; "أحمد"/"رانيا" -> doctor_hint.
+   - "date" -> choosing day; "بكرة"/"الأحد" -> date_hint; prefer select_option if
+     date_* options exist.
+   - "slot" -> choosing time; "2"/"الصبح" -> time_hint or select_option; prefer
+     select_option if slot_* options exist.
+   - "patient_name" -> providing full name; do NOT treat names as doctor hints;
+     action="intent", intent="book".
+   - "mrn_value" -> numeric is a medical record number, not an option/phone.
+   - "dob_value" -> a date is date-of-birth, NOT the appointment date.
+   - "confirm"/"summary" -> "نعم"/"موافق"/"تمام" -> intent="confirm";
+     "لا"/"غير" -> intent="update".
+   - "change_type" -> edit flow: "الدكتور" -> change doctor; "اليوم"/"التاريخ" ->
+     change date; "الميعاد"/"الوقت" -> change time. Set change_target accordingly.
+   - "inquiry_book_cta"/"no_slots_alt"/"pick_appointment"/"mrn_optional"/
+     "dob_gate"/"post_cancel" -> treat short yes/no answers as continuing that step.
+
+========================================================================
+EDIT / UPDATE FLOW HANDLING
+========================================================================
+Intent recognition: "عايز اعدل"/"اغير الموعد"/"تغيير الميعاد"/"تعديل الحجز" -> intent="update".
+
+1) WHAT to change -> set change_target:
+   "اغير الدكتور" -> change_target="doctor"
+   "اغير الميعاد"/"اغير الوقت" -> change_target="time"
+   "اغير اليوم"/"اغير التاريخ" -> change_target="date"
+   (action="intent", intent="update")
+2) NEW VALUE mentioned:
+   "غير الموعد لبكرة" -> date_hint="<tomorrow>"
+   "اغير للساعة 3" -> time_hint="15:00"
+   "اغير للدكتور أحمد" -> doctor_hint="أحمد"
+   If both WHAT and NEW VALUE present, use book_direct/specialty_direct and extract hints.
+3) CURRENT_STEP.awaiting="change_type": map "الدكتور"/"اليوم"/"الميعاد" or a number
+   in OPTIONS_JSON. Use select_option if it matches OPTIONS_JSON, else intent + change_target.
+
+========================================================================
+CONFIDENCE (rough guidance; final clamping/adjustments happen in code)
+========================================================================
+HIGH (0.8-1.0): clear doctor person name; exact option match; unambiguous date;
+  clear intent with context; known specialty with clear date/time.
+MEDIUM (0.5-0.79): doctor name slightly unclear; date needs validation; intent clear
+  but missing details; partial info.
+LOW (0.0-0.49): unclear audio; ambiguous words; incomplete sentences; cannot
+  determine intent even with context.
+
+========================================================================
+EXTRACTION PRIORITY
+========================================================================
+When OPTIONS_JSON is non-empty: first check for an option match (number/title);
+if matched -> select_option; else extract hints and pick action from content.
+When CURRENT_STEP.awaiting is set: first try to satisfy that step.
+Doctor vs specialty: known person name -> doctor_hint; known specialty -> specialty_hint;
+"دكتور قلب" -> specialty; "دكتور علي" -> doctor; if still unclear, confidence < 0.6.
+
+========================================================================
+LANGUAGE DETECTION (from the transcript)
+========================================================================
+Always set the 'language' field from the ACTUAL words/script of THIS transcript.
+Do NOT default to Arabic just because most patients speak Arabic — judge only by
+what was actually said.
+- Transcript written mostly in Latin/English letters -> "en" (or "en-US"/"en-GB"
+  if clearly regional). Example: "I want to book with Dr. Ahmed tomorrow" -> "en".
+- Transcript mostly in Arabic script -> "ar-EG" for Egyptian colloquial, or "ar" for MSA.
+- Roughly balanced Arabic + English -> "mixed".
+- Empty/pure noise -> "unknown"; if the transcript is clear, NEVER leave it unknown,
+  even when action="clarify".
+Language detection is INDEPENDENT of the hints: keep doctor_hint/specialty_hint in
+the same language they were spoken (do not translate an English name into Arabic).
+summary_ar is always written in Arabic regardless of 'language'.
+
+========================================================================
+KEY EXTRACTION CASES
+========================================================================
+- "دكتور قلب": if "قلب" is a known doctor person name -> doctor_hint; else specialty_hint.
+- Ambiguous hour ("الساعة 2"): default PM (14:00) unless "الصبح" implies AM.
+- Numeric while awaiting="patient_name"/"mrn_value": that step's value, NOT a doctor hint.
+- "No" while confirming ("لا"/"غير"): intent="update".
+- Multiple doctors ("أحمد أو علي"): take the FIRST -> doctor_hint="أحمد".
+- Nickname/partial name ("محمد"): keep as doctor_hint; backend resolves the full name.
+- Cancel mid-flow ("خلاص ماحتاجش"/"الغي الحجز"/"بطل"): intent="cancel" (or "menu").
+
+Keep transcript in Arabic. Never invent option ids."""
 
 # Retry: 2 attempts, backoff 1s then 3s (Task 1)
 _RETRY_BACKOFFS = (1.0, 3.0)
@@ -88,10 +292,12 @@ def _clarify_dict(
         "specialty_hint": understanding.specialty_hint,
         "date_hint": understanding.date_hint,
         "time_hint": understanding.time_hint,
+        "change_target": understanding.change_target,
         "summary_ar": understanding.summary_ar,
         "language": understanding.language,
         "stt_provider": provider,
         "media_id": media_id,
+        "cost": None,
         "understanding": understanding,
     }
 
@@ -264,19 +470,159 @@ def _sanitize(understanding: VoiceUnderstanding, options: list[Option] | None) -
     return understanding
 
 
-def _transcribe_ogg(ogg_bytes: bytes) -> str:
+def _build_stt_context_prompt(
+    db: Session | None,
+    clinic_id: int | None = None,
+    *,
+    now: float | None = None,
+) -> str:
+    """Short Whisper vocabulary bias: active doctor + department names/aliases."""
+    if db is None:
+        return ""
+    cid = int(clinic_id if clinic_id is not None else DEFAULT_CLINIC_ID)
+    ts = time.time() if now is None else now
+    cached = _STT_PROMPT_CACHE.get(cid)
+    if cached and cached[0] > ts:
+        return cached[1]
+
+    from app.services import doctor_service
+
+    parts: list[str] = [
+        "مستشفى جامعة الجيزة الجديدة.",
+        "أسماء الأطباء والتخصصات:",
+    ]
+    try:
+        doctors = doctor_service.list_active_doctors(db, cid, limit=40)
+        for doc in doctors:
+            names = [n for n in (doc.name_ar, doc.name_en) if n and str(n).strip()]
+            if names:
+                parts.append("، ".join(dict.fromkeys(names)))
+        departments = doctor_service.list_departments(db, cid)
+        dept_bits: list[str] = []
+        for dept in departments:
+            for n in (dept.name_ar, dept.name_en):
+                if n and str(n).strip():
+                    dept_bits.append(str(n).strip())
+        # Prefer short aliases; skip long descriptions
+        for word in sorted(specialty_alias_words(), key=len):
+            if len(word) <= 24:
+                dept_bits.append(word)
+        if dept_bits:
+            # de-dupe preserving order
+            parts.append("، ".join(dict.fromkeys(dept_bits)))
+    except Exception:
+        logger.exception("[voice] failed building STT context prompt clinic_id=%s", cid)
+        return ""
+
+    prompt = " ".join(parts)
+    if len(prompt) > _STT_PROMPT_MAX_CHARS:
+        prompt = prompt[: _STT_PROMPT_MAX_CHARS].rsplit("،", 1)[0].strip()
+    _STT_PROMPT_CACHE[cid] = (ts + _STT_PROMPT_TTL_SEC, prompt)
+    return prompt
+
+
+def clear_stt_prompt_cache() -> None:
+    """Test helper — drop in-process Whisper prompt cache."""
+    _STT_PROMPT_CACHE.clear()
+
+
+def _format_current_step_line(current_step: dict[str, Any] | None) -> str:
+    """One-line CURRENT_STEP context for the GPT routing user message."""
+    if not current_step:
+        return ""
+    # Lazy import avoids circular load with voice_fastpath.
+    from app.services.voice_fastpath import (
+        VOICE_FREE_TEXT_AWAITING,
+        VOICE_OPTION_AWAITING,
+    )
+
+    awaiting = str(current_step.get("awaiting") or "").strip()
+    doctor = str(current_step.get("known_doctor") or "").strip()
+    day = str(current_step.get("known_date") or "").strip()
+    specialty = str(current_step.get("known_specialty") or "").strip()
+
+    relevant = awaiting in VOICE_OPTION_AWAITING or awaiting in VOICE_FREE_TEXT_AWAITING
+    if not relevant and not (doctor or day or specialty):
+        return ""
+
+    if awaiting == "slot":
+        bits = ["patient already chose"]
+        if doctor:
+            bits.append(f"Dr. {doctor}")
+        if day:
+            bits.append(f"on {day}")
+        bits.append("and is now expected to say a time for their appointment")
+        detail = " ".join(bits)
+    elif awaiting == "date":
+        if doctor:
+            detail = (
+                f"patient already chose Dr. {doctor} and is now expected to say a day "
+                "for their appointment"
+            )
+        else:
+            detail = "patient is choosing an appointment day"
+    elif awaiting == "doctor":
+        if specialty:
+            detail = (
+                f"patient already chose specialty {specialty} and is now expected "
+                "to say or pick a doctor name"
+            )
+        else:
+            detail = "patient is choosing a doctor"
+    elif awaiting == "department":
+        detail = "patient is choosing a specialty/department"
+    elif awaiting in {"patient_name"}:
+        detail = "patient is expected to say their full name"
+    elif awaiting in {"mrn_value"}:
+        detail = "patient is expected to provide their medical record number"
+    elif awaiting in {"dob_value"}:
+        detail = "patient is expected to provide their date of birth"
+    elif awaiting in {"confirm", "summary", "mrn_optional", "dob_gate"}:
+        detail = "patient is confirming or answering a yes/no booking step"
+    elif awaiting in {"inquiry_book_cta", "no_slots_alt", "pick_appointment", "change_type", "post_cancel"}:
+        detail = f"patient is mid-flow (awaiting={awaiting}) and should answer that step"
+    elif doctor or day or specialty:
+        bits = ["patient is mid-booking"]
+        if doctor:
+            bits.append(f"with Dr. {doctor}")
+        if specialty:
+            bits.append(f"specialty {specialty}")
+        if day:
+            bits.append(f"date {day}")
+        detail = " ".join(bits)
+    else:
+        return ""
+
+    return (
+        f"CURRENT_STEP: {detail}. If the transcript only contains a day/time/name/"
+        "yes-no answer, treat it as continuing this booking, not a new request.\n"
+    )
+
+
+def _transcribe_ogg(
+    ogg_bytes: bytes,
+    *,
+    db: Session | None = None,
+    clinic_id: int | None = None,
+) -> str:
     def _do() -> str:
         client = _client()
+        stt_prompt = _build_stt_context_prompt(db, clinic_id)
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
             tmp.write(ogg_bytes)
             tmp_path = tmp.name
         try:
             with open(tmp_path, "rb") as audio_file:
-                transcript = client.audio.transcriptions.create(
-                    model=OPENAI_STT_MODEL,
-                    file=audio_file,
-                    language="ar",
-                )
+                # No forced `language`: patients speak Egyptian Arabic *or* English
+                # (often code-switched). Whisper auto-detects reliably; forcing "ar"
+                # mangled English speech into Arabic script before GPT ever saw it.
+                kwargs: dict[str, Any] = {
+                    "model": OPENAI_STT_MODEL,
+                    "file": audio_file,
+                }
+                if stt_prompt:
+                    kwargs["prompt"] = stt_prompt
+                transcript = client.audio.transcriptions.create(**kwargs)
             return (transcript.text or "").strip()
         finally:
             try:
@@ -288,9 +634,13 @@ def _transcribe_ogg(ogg_bytes: bytes) -> str:
 
 
 def _understand_via_gpt_text(
-    transcript: str, options: list[Option] | None
-) -> VoiceUnderstanding:
-    def _do() -> VoiceUnderstanding:
+    transcript: str,
+    options: list[Option] | None,
+    current_step: dict[str, Any] | None = None,
+) -> tuple[VoiceUnderstanding, dict[str, int]]:
+    """Return (understanding, token_usage) so callers can price the call."""
+
+    def _do() -> tuple[VoiceUnderstanding, dict[str, int]]:
         client = _client()
         parse_fn = (
             getattr(client.chat.completions, "parse", None)
@@ -306,6 +656,7 @@ def _understand_via_gpt_text(
             f"TODAY={today.isoformat()} (weekday={today.strftime('%A')}). "
             "Resolve weekdays/relative days relative to TODAY into YYYY-MM-DD.\n"
         )
+        step_line = _format_current_step_line(current_step)
         completion = parse_fn(
             model=OPENAI_VOICE_STRUCTURE_MODEL or OPENAI_MODEL,
             temperature=0,
@@ -315,6 +666,7 @@ def _understand_via_gpt_text(
                     "role": "user",
                     "content": (
                         today_line
+                        + step_line
                         + f"OPTIONS_JSON={json.dumps(catalog, ensure_ascii=False)}\n"
                         f"TRANSCRIPT: {transcript}\n"
                         "Return structured VoiceUnderstanding."
@@ -323,20 +675,25 @@ def _understand_via_gpt_text(
             ],
             response_format=VoiceUnderstanding,
         )
+        usage = voice_cost.usage_from_completion(completion)
         parsed = completion.choices[0].message.parsed
         if parsed is None:
-            return VoiceUnderstanding(
-                transcript=transcript,
-                action="clarify",
-                intent="unknown",
-                confidence=0.3,
-                summary_ar="لم أفهم الطلب بوضوح",
-                language="ar",
+            return (
+                VoiceUnderstanding(
+                    transcript=transcript,
+                    action="clarify",
+                    intent="unknown",
+                    confidence=0.3,
+                    summary_ar="لم أفهم الطلب بوضوح",
+                    language="ar",
+                ),
+                usage,
             )
-        return _sanitize(
+        understanding = _sanitize(
             parsed.model_copy(update={"transcript": transcript or parsed.transcript}),
             options,
         )
+        return understanding, usage
 
     return _with_retries("openai_voice_parse", _do)
 
@@ -344,6 +701,9 @@ def _understand_via_gpt_text(
 def route_whatsapp_voice_message(
     media_id: str,
     options: list[Option] | None = None,
+    current_step: dict[str, Any] | None = None,
+    db: Session | None = None,
+    clinic_id: int | None = None,
 ) -> dict:
     """
     Whisper (or gpt-4o-*-transcribe) → LLM Pydantic routing decision.
@@ -352,9 +712,14 @@ def route_whatsapp_voice_message(
     (same shape as empty transcript) so webhook can degrade gracefully.
     """
     provider = f"openai_stt:{OPENAI_STT_MODEL}+gpt_parse"
+    cid = clinic_id if clinic_id is not None else DEFAULT_CLINIC_ID
+    chat_model = OPENAI_VOICE_STRUCTURE_MODEL or OPENAI_MODEL
+    audio_seconds: float | None = None
+    usage: dict[str, int] = {"prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0}
     try:
         ogg_bytes = _download_whatsapp_audio(media_id)
-        transcript = _transcribe_ogg(ogg_bytes)
+        audio_seconds = voice_cost.estimate_audio_seconds(ogg_bytes)
+        transcript = _transcribe_ogg(ogg_bytes, db=db, clinic_id=cid)
         if not transcript:
             understanding = VoiceUnderstanding(
                 transcript="",
@@ -365,18 +730,36 @@ def route_whatsapp_voice_message(
                 language="unknown",
             )
         else:
-            understanding = _understand_via_gpt_text(transcript, options)
+            understanding, usage = _understand_via_gpt_text(
+                transcript, options, current_step=current_step
+            )
     except VoiceProcessingError:
         logger.exception("[voice] processing failed media_id=%s", media_id)
-        return _clarify_dict(
+        result = _clarify_dict(
             media_id,
             summary_ar="لم أفهم الرسالة الصوتية بوضوح",
             provider="failed",
         )
+        # Still bill STT if the audio downloaded/transcribed before the failure.
+        result["cost"] = voice_cost.estimate_voice_call_cost(
+            stt_model=OPENAI_STT_MODEL,
+            audio_seconds=audio_seconds,
+            chat_model=chat_model,
+            **usage,
+        )
+        logger.info("[voice][cost] %s", voice_cost.format_cost_log(result["cost"]))
+        return result
+
+    cost = voice_cost.estimate_voice_call_cost(
+        stt_model=OPENAI_STT_MODEL,
+        audio_seconds=audio_seconds,
+        chat_model=chat_model,
+        **usage,
+    )
 
     logger.info(
         "[voice] whisper+llm ok provider=%s action=%s option=%r intent=%s "
-        "doctor=%r specialty=%r date=%r time=%r conf=%.2f text=%r",
+        "doctor=%r specialty=%r date=%r time=%r change=%r conf=%.2f step=%r text=%r",
         provider,
         understanding.action,
         understanding.selected_option_id,
@@ -385,9 +768,12 @@ def route_whatsapp_voice_message(
         understanding.specialty_hint,
         understanding.date_hint,
         understanding.time_hint,
+        understanding.change_target,
         understanding.confidence,
+        (current_step or {}).get("awaiting"),
         understanding.transcript,
     )
+    logger.info("[voice][cost] %s", voice_cost.format_cost_log(cost))
 
     return {
         "text": understanding.transcript,
@@ -400,10 +786,12 @@ def route_whatsapp_voice_message(
         "specialty_hint": understanding.specialty_hint,
         "date_hint": understanding.date_hint,
         "time_hint": understanding.time_hint,
+        "change_target": understanding.change_target,
         "summary_ar": understanding.summary_ar,
         "language": understanding.language,
         "stt_provider": provider,
         "media_id": media_id,
+        "cost": cost,
         "understanding": understanding,
     }
 
@@ -411,9 +799,18 @@ def route_whatsapp_voice_message(
 def understand_whatsapp_audio(
     media_id: str,
     options: list[Option] | None = None,
+    current_step: dict[str, Any] | None = None,
+    db: Session | None = None,
+    clinic_id: int | None = None,
 ) -> dict:
     """Deprecated alias for route_whatsapp_voice_message."""
-    return route_whatsapp_voice_message(media_id, options=options)
+    return route_whatsapp_voice_message(
+        media_id,
+        options=options,
+        current_step=current_step,
+        db=db,
+        clinic_id=clinic_id,
+    )
 
 
 def transcribe_whatsapp_audio(media_id: str) -> dict:

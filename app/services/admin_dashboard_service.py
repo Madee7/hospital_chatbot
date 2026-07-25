@@ -881,6 +881,20 @@ def compute_kpis(db: Session, *, clinic_id: int, days: int = 30) -> dict[str, An
         or 0.0
     )
 
+    voice_cost_total = (
+        db.query(func.coalesce(func.sum(UsageLog.cost_estimate), 0.0))
+        .filter(
+            UsageLog.clinic_id == clinic_id,
+            UsageLog.created_at >= since,
+            UsageLog.operation.in_(["voice_stt", "voice_parse"]),
+        )
+        .scalar()
+        or 0.0
+    )
+    voice_cost_avg = (
+        (float(voice_cost_total) / voice_count) if voice_count else 0.0
+    )
+
     return {
         "period_days": days,
         "total_conversations": int(total_conversations),
@@ -903,6 +917,8 @@ def compute_kpis(db: Session, *, clinic_id: int, days: int = 30) -> dict[str, An
         "handover_open": int(open_handovers),
         "handover_closed": int(closed_handovers),
         "estimated_cost": float(cost_total),
+        "voice_estimated_cost": float(voice_cost_total),
+        "voice_cost_avg": round(float(voice_cost_avg), 6),
     }
 
 
