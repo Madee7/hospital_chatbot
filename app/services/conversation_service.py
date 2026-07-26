@@ -11,6 +11,16 @@ from app.models.conversation_models import Conversation, Message, VoiceMessage
 from app.models.usage_models import UsageLog
 
 
+def _as_latency_ms(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        ms = int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+    return ms if ms >= 0 else None
+
+
 def get_or_create_conversation(
     db: Session,
     *,
@@ -181,6 +191,7 @@ def log_voice_call_cost(
         operation="voice_stt",
         cost_estimate=float(cost.get("stt_usd") or 0.0),
         tokens_or_minutes=int(round(stt_seconds)),
+        latency_ms=_as_latency_ms(cost.get("stt_latency_ms")),
         status=status,
     )
 
@@ -195,5 +206,53 @@ def log_voice_call_cost(
         operation="voice_parse",
         cost_estimate=float(cost.get("chat_usd") or 0.0),
         tokens_or_minutes=total_tokens,
+        latency_ms=_as_latency_ms(cost.get("chat_latency_ms")),
+        status=status,
+    )
+
+
+def log_openai_chat_usage(
+    db: Session | None,
+    *,
+    tenant_id: int | None,
+    clinic_id: int | None,
+    model: str,
+    operation: str,
+    completion: object | None = None,
+    latency_ms: int | None = None,
+    status: str = "completed",
+) -> UsageLog | None:
+    """Persist one text-LLM call (intent / choice / rewrite) into usage_logs.
+
+    No-op when db/tenant/clinic are missing so unit tests and pure helpers stay light.
+    """
+    if db is None or tenant_id is None or clinic_id is None:
+        return None
+
+    from app.services import voice_cost
+
+    usage = (
+        voice_cost.usage_from_completion(completion)
+        if completion is not None
+        else {"prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0}
+    )
+    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+    cached_tokens = int(usage.get("cached_tokens") or 0)
+    completion_tokens = int(usage.get("completion_tokens") or 0)
+    cost_usd = voice_cost.estimate_gpt_cost(
+        model,
+        prompt_tokens=prompt_tokens,
+        cached_tokens=cached_tokens,
+        completion_tokens=completion_tokens,
+    )
+    return log_usage(
+        db,
+        tenant_id=tenant_id,
+        clinic_id=clinic_id,
+        provider=model or "openai",
+        operation=operation,
+        cost_estimate=float(cost_usd),
+        tokens_or_minutes=prompt_tokens + completion_tokens,
+        latency_ms=_as_latency_ms(latency_ms),
         status=status,
     )

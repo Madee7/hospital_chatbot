@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from enum import StrEnum
 
 from openai import OpenAI
+from sqlalchemy.orm import Session
 
 from app.core.config import OPENAI_API_KEY, OPENAI_MODEL
 from app.language.multilingual_prompt import build_system_prompt
+from app.services.conversation_service import log_openai_chat_usage
 
 
 class Intent(StrEnum):
@@ -80,7 +83,14 @@ def detect_intent_rules(text: str) -> Intent:
     return Intent.UNKNOWN
 
 
-def detect_intent(text: str, *, lang: str | None = None) -> Intent:
+def detect_intent(
+    text: str,
+    *,
+    lang: str | None = None,
+    db: Session | None = None,
+    tenant_id: int | None = None,
+    clinic_id: int | None = None,
+) -> Intent:
     """Rules first; OpenAI only when unclear and key is configured."""
     intent = detect_intent_rules(text)
     if intent != Intent.UNKNOWN:
@@ -89,6 +99,7 @@ def detect_intent(text: str, *, lang: str | None = None) -> Intent:
         return Intent.UNKNOWN
     try:
         client = OpenAI(api_key=OPENAI_API_KEY)
+        t0 = time.perf_counter()
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
             temperature=0,
@@ -103,6 +114,17 @@ def detect_intent(text: str, *, lang: str | None = None) -> Intent:
                 {"role": "user", "content": text},
             ],
         )
+        latency_ms = int(round((time.perf_counter() - t0) * 1000))
+        log_openai_chat_usage(
+            db,
+            tenant_id=tenant_id,
+            clinic_id=clinic_id,
+            model=OPENAI_MODEL,
+            operation="text_intent",
+            completion=completion,
+            latency_ms=latency_ms,
+            status="completed",
+        )
         content = completion.choices[0].message.content or "{}"
         payload = json.loads(content)
         value = str(payload.get("intent", "unknown")).lower().strip()
@@ -110,4 +132,13 @@ def detect_intent(text: str, *, lang: str | None = None) -> Intent:
             return Intent(value)
         return Intent.UNKNOWN
     except Exception:
+        log_openai_chat_usage(
+            db,
+            tenant_id=tenant_id,
+            clinic_id=clinic_id,
+            model=OPENAI_MODEL,
+            operation="text_intent",
+            completion=None,
+            status="failed",
+        )
         return Intent.UNKNOWN

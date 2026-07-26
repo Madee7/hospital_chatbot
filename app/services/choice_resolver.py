@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any
 
 from openai import OpenAI
+from sqlalchemy.orm import Session
 
 from app.core.config import OPENAI_API_KEY, OPENAI_MODEL
 from app.language.multilingual_prompt import build_system_prompt
+from app.services.conversation_service import log_openai_chat_usage
 
 
 Option = dict[str, Any]  # id, title, description?
@@ -65,6 +68,9 @@ def resolve_choice_llm(
     options: list[Option],
     *,
     lang: str | None = None,
+    db: Session | None = None,
+    tenant_id: int | None = None,
+    clinic_id: int | None = None,
 ) -> str | None:
     """Ask OpenAI which option id matches; return only that id or None."""
     if not OPENAI_API_KEY or not user_text.strip() or not options:
@@ -80,6 +86,7 @@ def resolve_choice_llm(
     ]
     try:
         client = OpenAI(api_key=OPENAI_API_KEY)
+        t0 = time.perf_counter()
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
             temperature=0,
@@ -100,6 +107,17 @@ def resolve_choice_llm(
                 },
             ],
         )
+        latency_ms = int(round((time.perf_counter() - t0) * 1000))
+        log_openai_chat_usage(
+            db,
+            tenant_id=tenant_id,
+            clinic_id=clinic_id,
+            model=OPENAI_MODEL,
+            operation="text_choice",
+            completion=completion,
+            latency_ms=latency_ms,
+            status="completed",
+        )
         content = completion.choices[0].message.content or "{}"
         payload = json.loads(content)
         option_id = payload.get("option_id")
@@ -110,6 +128,15 @@ def resolve_choice_llm(
         return option_id if option_id in allowed else None
     except Exception as exc:
         print(f"[choice_resolver] LLM failed: {exc}")
+        log_openai_chat_usage(
+            db,
+            tenant_id=tenant_id,
+            clinic_id=clinic_id,
+            model=OPENAI_MODEL,
+            operation="text_choice",
+            completion=None,
+            status="failed",
+        )
         return None
 
 
@@ -118,6 +145,9 @@ def resolve_choice(
     options: list[Option] | None,
     *,
     lang: str | None = None,
+    db: Session | None = None,
+    tenant_id: int | None = None,
+    clinic_id: int | None = None,
 ) -> str | None:
     """Rules first, then LLM. Returns option id or None."""
     options = options or []
@@ -126,4 +156,11 @@ def resolve_choice(
     hit = resolve_choice_rules(user_text, options)
     if hit:
         return hit
-    return resolve_choice_llm(user_text, options, lang=lang)
+    return resolve_choice_llm(
+        user_text,
+        options,
+        lang=lang,
+        db=db,
+        tenant_id=tenant_id,
+        clinic_id=clinic_id,
+    )

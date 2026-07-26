@@ -131,6 +131,8 @@ def test_log_voice_call_cost_writes_two_usage_rows():
         prompt_tokens=3200,
         cached_tokens=3000,
         completion_tokens=40,
+        stt_latency_ms=450,
+        chat_latency_ms=900,
     )
 
     log_voice_call_cost(db, tenant_id=1, clinic_id=2, cost=cost)
@@ -143,8 +145,11 @@ def test_log_voice_call_cost_writes_two_usage_rows():
         assert row.tenant_id == 1
         assert row.clinic_id == 2
         assert row.cost_estimate >= 0
+    stt_row = next(r for r in added if r.operation == "voice_stt")
     parse_row = next(r for r in added if r.operation == "voice_parse")
     assert parse_row.tokens_or_minutes == 3240  # prompt + completion
+    assert stt_row.latency_ms == 450
+    assert parse_row.latency_ms == 900
 
 
 def test_log_voice_call_cost_noop_when_cost_missing():
