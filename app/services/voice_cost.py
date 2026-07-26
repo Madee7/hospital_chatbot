@@ -139,6 +139,8 @@ def estimate_voice_call_cost(
     prompt_tokens: int = 0,
     cached_tokens: int = 0,
     completion_tokens: int = 0,
+    stt_latency_ms: int | None = None,
+    chat_latency_ms: int | None = None,
 ) -> dict[str, Any]:
     """Full per-voice-call cost breakdown in USD."""
     stt_usd = estimate_stt_cost(stt_model, audio_seconds)
@@ -154,12 +156,14 @@ def estimate_voice_call_cost(
         "stt_model": stt_model,
         "stt_seconds": round(audio_seconds, 2) if audio_seconds else 0.0,
         "stt_usd": round(stt_usd, 6),
+        "stt_latency_ms": stt_latency_ms,
         "chat_model": chat_model,
         "prompt_tokens": prompt_tokens,
         "cached_tokens": cached_tokens,
         "uncached_prompt_tokens": prompt_tokens - cached_tokens,
         "completion_tokens": max(0, int(completion_tokens or 0)),
         "chat_usd": round(chat_usd, 6),
+        "chat_latency_ms": chat_latency_ms,
         "total_usd": round(stt_usd + chat_usd, 6),
     }
 

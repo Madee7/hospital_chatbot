@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import re
+import time
 from typing import Any, Literal
 
 from openai import OpenAI
+from sqlalchemy.orm import Session
 
 from app.core import i18n_bot as i18n
 from app.core.config import OPENAI_API_KEY, OPENAI_MODEL
 from app.language.multilingual_prompt import build_system_prompt
+from app.services.conversation_service import log_openai_chat_usage
 
 LangCode = Literal["ar", "en"]
 
@@ -63,11 +66,19 @@ def validate_response_language(text: str | None, lang: Any) -> bool:
     return True
 
 
-def _rewrite_in_language(text: str, lang: LangCode) -> str | None:
+def _rewrite_in_language(
+    text: str,
+    lang: LangCode,
+    *,
+    db: Session | None = None,
+    tenant_id: int | None = None,
+    clinic_id: int | None = None,
+) -> str | None:
     if not OPENAI_API_KEY or not text.strip():
         return None
     try:
         client = OpenAI(api_key=OPENAI_API_KEY)
+        t0 = time.perf_counter()
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
             temperature=0,
@@ -79,14 +90,42 @@ def _rewrite_in_language(text: str, lang: LangCode) -> str | None:
                 {"role": "user", "content": text},
             ],
         )
+        latency_ms = int(round((time.perf_counter() - t0) * 1000))
+        log_openai_chat_usage(
+            db,
+            tenant_id=tenant_id,
+            clinic_id=clinic_id,
+            model=OPENAI_MODEL,
+            operation="text_rewrite",
+            completion=completion,
+            latency_ms=latency_ms,
+            status="completed",
+        )
         rewritten = (completion.choices[0].message.content or "").strip()
         return rewritten or None
     except Exception as exc:  # pragma: no cover
         print(f"[response_validator] rewrite failed: {exc}")
+        log_openai_chat_usage(
+            db,
+            tenant_id=tenant_id,
+            clinic_id=clinic_id,
+            model=OPENAI_MODEL,
+            operation="text_rewrite",
+            completion=None,
+            status="failed",
+        )
         return None
 
 
-def ensure_response_language(text: str | None, lang: Any, *, max_retries: int = 1) -> str:
+def ensure_response_language(
+    text: str | None,
+    lang: Any,
+    *,
+    max_retries: int = 1,
+    db: Session | None = None,
+    tenant_id: int | None = None,
+    clinic_id: int | None = None,
+) -> str:
     """Validate outbound text; rewrite via LLM if it mixes languages.
 
     Static i18n templates should already be correct; this guards LLM output.
@@ -98,7 +137,13 @@ def ensure_response_language(text: str | None, lang: Any, *, max_retries: int = 
 
     current = raw
     for _ in range(max(1, max_retries)):
-        rewritten = _rewrite_in_language(current, code)
+        rewritten = _rewrite_in_language(
+            current,
+            code,
+            db=db,
+            tenant_id=tenant_id,
+            clinic_id=clinic_id,
+        )
         if not rewritten:
             break
         if validate_response_language(rewritten, code):
