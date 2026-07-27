@@ -24,6 +24,8 @@ app = FastAPI(
 
 @app.on_event("startup")
 def on_startup() -> None:
+    # Prefer `alembic upgrade head` on deploy. create_tables() remains as a
+    # safe idempotent fallback (creates missing tables only; no migrations).
     try:
         create_tables()
     except Exception as exc:
