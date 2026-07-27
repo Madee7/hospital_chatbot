@@ -23,4 +23,5 @@ jobs:
             cd C:\apps\hospital-chatbot
             git pull
             .\venv\Scripts\pip.exe install -r requirements.txt
+            .\venv\Scripts\python.exe -m alembic upgrade head
             Restart-Service HospitalChatbotBackend
