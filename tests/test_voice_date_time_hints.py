@@ -74,6 +74,7 @@ def test_a_full_match_exact_slot():
         date_hint="2023-10-31",  # stale GPT date ignored
         time_hint="٢",
         transcript="عايز أحجز مع دكتور منى يوم السبت الساعة ٢",
+        today=_TODAY,
     )
     assert matched is not None
     assert matched["slot_id"] == 114

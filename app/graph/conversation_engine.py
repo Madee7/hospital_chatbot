@@ -64,6 +64,7 @@ class GraphState(TypedDict, total=False):
     conversation_id: int
     conversation_state: str
     language: str
+    keep_language: bool
     handled: bool
 
 
@@ -74,20 +75,37 @@ def _sess(phone: str) -> dict[str, Any]:
 
 
 def _clear_draft(phone: str) -> None:
-    """Drop booking draft keys but keep the live conversation language."""
+    """Drop booking draft keys but keep live language + voice-lang sticky flags."""
     prev = _SESSION.get(phone) or {}
-    lang = prev.get("language")
+    keep = {
+        k: prev[k]
+        for k in (
+            "language",
+            "voice_lang_locked",
+            "voice_lang_locked_at",
+            "allow_voice_lang_switch",
+        )
+        if prev.get(k) is not None
+    }
     _SESSION.pop(phone, None)
-    if lang:
-        _sess(phone)["language"] = lang
+    if keep:
+        _sess(phone).update(keep)
 
 
 def _sess_clear_keep_lang(sess: dict[str, Any]) -> None:
     """Clear draft keys on an existing session dict without dropping language."""
-    lang = sess.get("language")
+    keep = {
+        k: sess[k]
+        for k in (
+            "language",
+            "voice_lang_locked",
+            "voice_lang_locked_at",
+            "allow_voice_lang_switch",
+        )
+        if sess.get(k) is not None
+    }
     sess.clear()
-    if lang:
-        sess["language"] = lang
+    sess.update(keep)
 
 
 def _sess_missing(
@@ -249,6 +267,9 @@ def _send_main_menu(phone: str, db: Session, conversation: Conversation) -> None
         ],
         section_title=i18n.menu_section_title(lang),
     )
+    # After the menu, the next clear voice note may switch EN↔AR.
+    # Mid-booking voice must stay sticky (see LanguageService.apply_voice_language).
+    _sess(phone)["allow_voice_lang_switch"] = True
     set_conversation_state(
         db, conversation, ConversationState.MAIN_MENU, current_intent="main_menu"
     )
@@ -993,7 +1014,13 @@ def node_handle(state: GraphState) -> GraphState:
 
     # ---- Per-message language detection (before any LLM / reply work) ----
     lang_svc = LanguageService(db, conversation, sess)
-    lang = lang_svc.sync_from_user_text(text, payload_id=payload_id)
+    if state.get("keep_language"):
+        # Synthesized routing seed from the voice fastpath: the caller's language
+        # was already decided from the audio, which is more reliable than
+        # detecting it from our own Arabic seed text.
+        lang = lang_svc.language
+    else:
+        lang = lang_svc.sync_from_user_text(text, payload_id=payload_id)
     db.commit()
 
     choice = _choice(state, lang=lang)
@@ -1465,20 +1492,32 @@ def node_handle(state: GraphState) -> GraphState:
                 db.commit()
                 return {**state, "handled": True}
             else:
-                _offer_buttons(
-                    phone,
-                    i18n.known_patient_prompt(
-                        lang, sess.get("known_patient_name") or ""
-                    ),
-                    i18n.known_patient_buttons(lang),
-                )
-                return {**state, "handled": True}
+                # Voice: "أنا اسمي علي محمود…" — accept a spoken triple name
+                # instead of only the Same patient / Name changed buttons.
+                cleaned = patient_service.normalize_person_name(text)
+                if patient_service.is_triple_name(cleaned):
+                    sess["patient_name"] = cleaned
+                    _clear_options(phone)
+                    if _advance_after_patient_name(phone, sess, lang=lang):
+                        db.commit()
+                        return {**state, "handled": True}
+                    # awaiting=summary → fall through below
+                else:
+                    _offer_buttons(
+                        phone,
+                        i18n.known_patient_prompt(
+                            lang, sess.get("known_patient_name") or ""
+                        ),
+                        i18n.known_patient_buttons(lang),
+                    )
+                    return {**state, "handled": True}
 
         if sess.get("awaiting") == "patient_name":
             cleaned = patient_service.normalize_person_name(text)
             if not patient_service.is_triple_name(cleaned):
                 wa.send_text(phone, i18n.patient_name_too_short(lang))
                 return {**state, "handled": True}
+            # Overwrite any previous draft name (voice correction).
             sess["patient_name"] = cleaned
             if _advance_after_patient_name(phone, sess, lang=lang):
                 db.commit()
@@ -2040,7 +2079,14 @@ def process_incoming_message(
     text: str,
     payload_id: str | None = None,
     message_type: str = "text",
+    keep_language: bool = False,
 ) -> None:
+    """Run one inbound turn through the graph.
+
+    keep_language: the text is bot-synthesized (a voice fastpath routing seed
+    like "حجز موعد"), not the patient's own words, so language must NOT be
+    re-detected from it — that flipped English callers back to Arabic.
+    """
     get_graph().invoke(
         {
             "phone": phone,
@@ -2049,5 +2095,6 @@ def process_incoming_message(
             "message_type": message_type,
             "db_session": db,
             "handled": False,
+            "keep_language": keep_language,
         }
     )

@@ -215,6 +215,10 @@ def _handle_voice(phone: str, media_id: str | None) -> None:
         lang = get_conversation_language(conversation, sess)
         current_step = _voice_current_step(db, sess, conversation)
 
+        # Never pin Whisper language — forcing ar/en made Egyptian dialect worse.
+        # Reply language is chosen after STT from the transcript script.
+        from app.language.language_service import LanguageService
+
         result = voice_service.route_whatsapp_voice_message(
             media_id,
             options=options,
@@ -259,29 +263,35 @@ def _handle_voice(phone: str, media_id: str | None) -> None:
             cost=cost,
         )
 
-        # Switch the conversation to the language actually spoken, so replies
-        # (engine i18n + fastpath text) come back in the caller's language.
-        # Only ar/en are actionable; mixed/unknown keep the current language.
-        understanding = result.get("understanding")
-        voice_lang = (
-            understanding.base_language() if understanding is not None else None
+        # Reply language follows clear speech in the transcript (EN↔AR).
+        # Garbage / unclear notes keep the previous reply language.
+        lang = LanguageService(db, conversation, sess).apply_voice_language(transcript)
+        _log(
+            f"[webhook] voice reply_lang={lang} locked={sess.get('voice_lang_locked')} "
+            f"locked_at={sess.get('voice_lang_locked_at')}"
         )
-        if voice_lang in ("ar", "en"):
-            from app.language.language_service import LanguageService
-
-            lang = LanguageService(db, conversation, sess).set_language(voice_lang)
         db.commit()
 
         awaiting = sess.get("awaiting")
+
+        # ---- V2: LLM planned the step. Executor runs it. Stop. ----
+        # Do NOT fall through into the V1 fastpath maze — that second-guesses
+        # the model and is what made voice feel worse.
+        plan = result.get("plan")
+        if plan is not None:
+            from app.services import voice_executor
+
+            voice_executor.execute_plan(
+                db, phone=phone, plan=plan, conversation=conversation
+            )
+            return
+
+        # ---- V1 legacy path (only when VOICE_ROUTER_V2 is off) ----
         if (
             awaiting in {"patient_name", "mrn_value", "dob_value"}
             and transcript
             and not voice_fastpath.voice_wants_flow_switch(result)
         ):
-            # Normal case: the spoken reply is the answer (their name / MRN / DOB).
-            # If instead they voiced a *different* request (a new reservation,
-            # cancel, etc.), skip this capture and let the router below switch
-            # flows rather than forcing the sentence in as their name.
             process_incoming_message(
                 db,
                 phone=phone,
@@ -291,8 +301,6 @@ def _handle_voice(phone: str, media_id: str | None) -> None:
             )
             return
 
-        # Let fastpath try first — do not gate on action/confidence here.
-        # clarify + usable hints (bare time, doctor fragment, etc.) must reach midflow.
         if voice_fastpath.try_voice_smart_route(db, phone=phone, result=result):
             return
 
@@ -306,12 +314,6 @@ def _handle_voice(phone: str, media_id: str | None) -> None:
             )
             return
 
-        # Any clean transcript that GPT didn't explicitly flag as "clarify"
-        # goes to the normal text engine, which handles greetings, MENU,
-        # booking words, and its own graceful fallback. Do NOT gate on the
-        # router's confidence here: a valid greeting scores conf=0.0 because
-        # it isn't a booking action, and gating on it dropped real speech
-        # into the generic "didn't understand" reply.
         if transcript and action != "clarify":
             process_incoming_message(
                 db,
@@ -322,10 +324,6 @@ def _handle_voice(phone: str, media_id: str | None) -> None:
             )
             return
 
-        # GPT said "clarify". If we're NOT mid-flow, a clean transcript should
-        # still reach the engine (it opens the menu for greetings/unknown text)
-        # instead of a dead-end. Mid-flow (awaiting set) keeps the targeted
-        # fallback below so we can re-ask the specific question.
         if transcript and not awaiting:
             process_incoming_message(
                 db,

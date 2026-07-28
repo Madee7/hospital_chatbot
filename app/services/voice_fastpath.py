@@ -154,6 +154,113 @@ def _wants_change_day(result: dict[str, Any], transcript: str) -> bool:
     return any(p in n for p in _CHANGE_DAY_PHRASES)
 
 
+_OTHER_DOCTOR_PHRASES = (
+    "دكتور تاني",
+    "دكتور ثاني",
+    "دكتور اخر",
+    "دكتور آخر",
+    "طبيب تاني",
+    "طبيب ثاني",
+    "مش عايز دكتور",
+    "مش عايز الدكتور",
+    "غير الدكتور",
+    "غير الطبيب",
+    "تغيير الدكتور",
+    "تغيير الطبيب",
+    "another doctor",
+    "other doctor",
+    "different doctor",
+    "change doctor",
+    "change the doctor",
+)
+
+
+def _wants_other_doctor(result: dict[str, Any], transcript: str) -> bool:
+    """True when the patient wants a *different* doctor (not cancel the whole draft).
+
+    Critical at summary/confirm: "مش عايز دكتور دا / عايز دكتور تاني" must NOT be
+    read as "إلغاء" just because it contains "مش عايز".
+    """
+    if (result.get("change_target") or "").strip().lower() == "doctor":
+        return True
+    n = _norm_ar(transcript)
+    if any(p in n for p in _OTHER_DOCTOR_PHRASES):
+        return True
+    if ("دكتور" in n or "doctor" in n) and any(
+        w in n for w in ("تاني", "ثاني", "اخر", "آخر", "another", "other", "different")
+    ):
+        return True
+    return False
+
+
+def _restart_doctor_picker(
+    db: Session,
+    *,
+    phone: str,
+    conversation,
+    result: dict[str, Any],
+) -> bool:
+    """Abandon the current draft doctor/slot and show doctors to pick from.
+
+    Prefer the spoken specialty, else the department already on the draft, else
+    the full doctor list. Never auto-selects a doctor.
+    """
+    from app.graph.conversation_engine import _clear_draft, _show_doctor_cards
+    from app.services.conversation_service import set_conversation_state
+
+    sess = _sess(phone)
+    prev_doctor_id = sess.get("doctor_id")
+    prev_dept_id = sess.get("department_id")
+    lang = _reply_lang(phone)
+
+    dept = _resolve_specialty_department(db, result)
+    department_id = dept.department_id if dept else prev_dept_id
+    dept_name = None
+    if dept:
+        dept_name = (
+            (dept.name_en or dept.name_ar)
+            if i18n.is_english(lang)
+            else (dept.name_ar or dept.name_en)
+        )
+    elif department_id:
+        for d in doctor_service.list_departments(db, DEFAULT_CLINIC_ID):
+            if d.department_id == int(department_id):
+                dept_name = (
+                    (d.name_en or d.name_ar)
+                    if i18n.is_english(lang)
+                    else (d.name_ar or d.name_en)
+                )
+                break
+
+    _clear_draft(phone)
+    sess = _sess(phone)
+    sess["flow"] = "booking"
+    sess["awaiting"] = "doctor"
+    if department_id:
+        sess["department_id"] = int(department_id)
+    if prev_doctor_id:
+        sess["voice_excluded_doctor_id"] = int(prev_doctor_id)
+
+    set_conversation_state(
+        db,
+        conversation,
+        ConversationState.BOOKING_DOCTOR,
+        current_intent="voice_change_doctor",
+    )
+    db.commit()
+
+    wa.send_text(phone, i18n.voice_pick_another_doctor(lang, dept_name))
+    ok = _show_doctor_cards(phone, db, department_id)
+    logger.info(
+        "[voice_fast] change-doctor → doctor list dept=%s excluded=%s ok=%s phone=%s",
+        department_id,
+        prev_doctor_id,
+        ok,
+        phone,
+    )
+    return bool(ok)
+
+
 def _state_value(conversation) -> str:
     raw = getattr(conversation, "state", None)
     if raw is None:
@@ -170,12 +277,17 @@ def _dispatch(
 ) -> bool:
     from app.graph import process_incoming_message
 
+    # Every seed here is synthesized by us (Arabic routing phrases like
+    # "حجز موعد", or a transcript we already language-detected from the audio).
+    # keep_language stops the engine re-detecting Arabic from our own seed and
+    # switching an English caller's replies back to Arabic.
     process_incoming_message(
         db,
         phone=phone,
         text=text or "",
         payload_id=payload_id,
         message_type="interactive" if payload_id else "text",
+        keep_language=True,
     )
     return True
 
@@ -380,6 +492,7 @@ def match_slot(
     date_hint: str | None,
     time_hint: str | None,
     transcript: str | None = None,
+    today: date | None = None,
 ) -> dict | None:
     """Pick a slot dict from availability using date + time hints."""
     if not avail_dates:
@@ -389,6 +502,7 @@ def match_slot(
         date_hint=date_hint,
         transcript=transcript,
         available=set(avail_dates.keys()),
+        today=today,
     )
     if not date_key:
         return None
@@ -500,6 +614,22 @@ def _resolve_specialty_department(db: Session, result: dict[str, Any]):
     return doctor_service.infer_department_from_text(db, DEFAULT_CLINIC_ID, transcript)
 
 
+def _clear_stale_doctor_option(result: dict[str, Any], *, reason: str) -> None:
+    """Drop a hallucinated doctor_* option when the patient named a specialty.
+
+    Prod: transcript='خلينا دكتور عيون' but selected_option_id='doctor_14' —
+    midflow trusted the option and never switched to ophthalmology.
+    """
+    opt = result.get("selected_option_id")
+    if opt and str(opt).startswith("doctor_"):
+        logger.info(
+            "[voice_fast] clearing stale %s after %s (was not a person name)",
+            opt,
+            reason,
+        )
+        result["selected_option_id"] = None
+
+
 def _enrich_result(db: Session, result: dict[str, Any]) -> dict[str, Any]:
     """Normalize doctor_hint vs specialty_hint from typical Egyptian phrasing."""
     result = dict(result)
@@ -518,6 +648,7 @@ def _enrich_result(db: Session, result: dict[str, Any]) -> dict[str, Any]:
                 result["doctor_hint"] = None
                 result["action"] = "specialty_direct"
                 result["intent"] = result.get("intent") or "book"
+                _clear_stale_doctor_option(result, reason="doctor_hint→specialty remap")
                 logger.info(
                     f"[voice_fast] remapped doctor_hint={doctor_hint!r} "
                     f"→ specialty={result['specialty_hint']!r}"
@@ -534,11 +665,260 @@ def _enrich_result(db: Session, result: dict[str, Any]) -> dict[str, Any]:
         ):
             # Only auto-fill specialty_hint; don't force action yet
             result["specialty_hint"] = inferred.name_ar or inferred.name_en
+            # Same trap: LLM invents doctor_N while the words are a specialty.
+            if not result.get("doctor_hint"):
+                _clear_stale_doctor_option(result, reason="transcript specialty infer")
+                if (result.get("action") or "").strip().lower() == "book_direct":
+                    result["action"] = "specialty_direct"
             logger.info(
                 f"[voice_fast] inferred specialty from transcript "
                 f"→ {result['specialty_hint']!r}"
             )
+    elif not find_doctor_by_hint(
+        db, DEFAULT_CLINIC_ID, str(result.get("doctor_hint") or "")
+    ):
+        # specialty already set (or remapped) and no real person named →
+        # never keep a stale doctor_* option from the open list.
+        _clear_stale_doctor_option(result, reason="specialty without person")
+
+    # Drop a CURRENT_STEP-echoed doctor when the patient only named a specialty.
+    # Prod: "كمان عايز أحجز أعصاب" + doctor_hint='كريم شريف' → kept cardiology.
+    transcript = (result.get("transcript") or result.get("text") or "").strip()
+    doctor_hint = result.get("doctor_hint")
+    if (
+        doctor_hint
+        and result.get("specialty_hint")
+        and _transcript_names_specialty(db, result, transcript)
+    ):
+        n = _norm_ar(transcript)
+        # Keep the doctor only if their name was actually spoken this turn.
+        name_bits = [
+            b
+            for b in _norm_ar(str(doctor_hint)).split()
+            if len(b) >= 3 and b not in {"دكتور", "الدكتور", "doctor"}
+        ]
+        spoken_person = any(b in n for b in name_bits)
+        if not spoken_person:
+            logger.info(
+                "[voice_fast] dropping carried doctor_hint=%r — transcript only "
+                "names specialty=%r",
+                doctor_hint,
+                result.get("specialty_hint"),
+            )
+            result["doctor_hint"] = None
+            if (result.get("action") or "").strip().lower() == "book_direct":
+                result["action"] = "specialty_direct"
+            _clear_stale_doctor_option(result, reason="carried doctor + spoken specialty")
     return result
+
+
+def _show_specialty_doctors_midflow(
+    db: Session,
+    *,
+    phone: str,
+    sess: dict[str, Any],
+    dept,
+) -> bool:
+    """Replace the open doctor list with doctors from a newly spoken specialty."""
+    from app.graph.conversation_engine import _show_doctor_cards
+
+    sess["department_id"] = dept.department_id
+    sess["awaiting"] = "doctor"
+    sess.pop("doctor_id", None)
+    lang = _reply_lang(phone)
+    dept_name = (
+        (dept.name_en or dept.name_ar)
+        if i18n.is_english(lang)
+        else (dept.name_ar or dept.name_en)
+    ) or ""
+    wa.send_text(phone, i18n.voice_specialty_open_doctors(lang, dept_name))
+    ok = bool(_show_doctor_cards(phone, db, dept.department_id))
+    logger.info(
+        "[voice_fast] midflow specialty switch → dept=%s (%s) ok=%s phone=%s",
+        dept.department_id,
+        dept_name,
+        ok,
+        phone,
+    )
+    return ok
+
+
+def _transcript_names_specialty(db: Session, result: dict[str, Any], transcript: str) -> bool:
+    """True when the patient's words (not CURRENT_STEP echo) name a specialty."""
+    n = _norm_ar(transcript)
+    if not n:
+        return False
+    spec = _norm_ar(str(result.get("specialty_hint") or ""))
+    if spec and spec in n:
+        return True
+    return bool(
+        doctor_service.infer_department_from_text(db, DEFAULT_CLINIC_ID, transcript)
+    )
+
+
+def _continue_booking_with_doctor(
+    db: Session,
+    *,
+    phone: str,
+    conversation,
+    doctor: Doctor,
+    result: dict[str, Any],
+    reset_session: bool = False,
+) -> bool:
+    """After a doctor is known: hold exact slot, else same-day slots, else day picker.
+
+    Used by book_direct AND midflow doctor picks so "دكتور كريم يوم الثلاثة الساعة 5"
+    never collapses to the bare day picker when that day is available.
+    """
+    from app.services.conversation_service import set_conversation_state
+
+    date_hint = result.get("date_hint")
+    time_hint = result.get("time_hint")
+    transcript = (result.get("transcript") or result.get("text") or "").strip()
+    sess = _sess(phone)
+
+    if reset_session:
+        hints = {
+            k: sess.get(k)
+            for k in (
+                "voice_doctor_hint",
+                "voice_specialty_hint",
+                "voice_date_hint",
+                "voice_time_hint",
+                "voice_transcript",
+                "language",
+            )
+            if sess.get(k)
+        }
+        sess.clear()
+        sess.update(hints)
+
+    sess["flow"] = "booking"
+    prev_doctor = sess.get("doctor_id")
+    sess["doctor_id"] = doctor.doctor_id
+    if getattr(doctor, "department_id", None):
+        sess["department_id"] = doctor.department_id
+    # New doctor / new day-time choice invalidates prior slot/name on the draft.
+    if prev_doctor != doctor.doctor_id or result.get("date_hint") or result.get("time_hint"):
+        for k in ("slot_id", "selected_date", "patient_name", "dob"):
+            sess.pop(k, None)
+
+    doctor_name = doctor.name_ar or doctor.name_en or str(doctor.doctor_id)
+    booking_service.release_expired_holds(db, clinic_id=DEFAULT_CLINIC_ID)
+    avail = booking_service.get_available_dates_and_slots(
+        db, doctor_id=doctor.doctor_id, clinic_id=DEFAULT_CLINIC_ID
+    )
+    dates = avail.get("dates") or {}
+
+    matched = match_slot(
+        dates,
+        date_hint=date_hint,
+        time_hint=time_hint,
+        transcript=transcript,
+    )
+    if matched:
+        slot_id = int(matched.get("slot_id") or matched.get("id") or 0)
+        if slot_id:
+            try:
+                booking_service.hold_slot(
+                    db,
+                    slot_id=slot_id,
+                    clinic_id=DEFAULT_CLINIC_ID,
+                    held_by_phone=phone,
+                    hold_minutes=SLOT_HOLD_MINUTES,
+                )
+            except BookingError:
+                wa.send_text(
+                    phone,
+                    i18n.voice_slot_taken(
+                        _reply_lang(phone),
+                        doctor_name,
+                        str(date_hint or ""),
+                    ),
+                )
+                matched = None
+            else:
+                sess["slot_id"] = slot_id
+                start = matched.get("slot_start") or matched.get("start")
+                when = (
+                    start.strftime("%Y-%m-%d %H:%M")
+                    if isinstance(start, datetime)
+                    else str(start)
+                )
+                set_conversation_state(
+                    db,
+                    conversation,
+                    ConversationState.PATIENT_DETAILS,
+                    current_intent="voice_book_direct",
+                )
+                sess["awaiting"] = "patient_name"
+                sess.pop("last_options", None)
+                wa.send_text(
+                    phone,
+                    i18n.voice_slot_held(_reply_lang(phone), doctor_name, when),
+                )
+                db.commit()
+                logger.info(
+                    "[voice_fast] held slot_id=%s doctor=%s phone=%s",
+                    slot_id,
+                    doctor.doctor_id,
+                    phone,
+                )
+                return True
+
+    # Day available → skip the day picker and show that day's times.
+    date_key = resolve_date_key(
+        date_hint=date_hint,
+        transcript=transcript,
+        available=set(dates.keys()) if dates else None,
+    )
+    if date_key and date_key in dates:
+        from app.graph.conversation_engine import (
+            _date_option_title,
+            _lang,
+            _offer_list,
+            _slot_rows_with_change_day,
+        )
+
+        day_slots = dates.get(date_key) or []
+        if day_slots:
+            sess["selected_date"] = date_key
+            sess["awaiting"] = "slot"
+            set_conversation_state(
+                db,
+                conversation,
+                ConversationState.BOOKING_SLOT,
+                current_intent="voice_book_date",
+            )
+            lang = _lang(conversation)
+            date_label = _date_option_title(date_key, lang)
+            _offer_list(
+                phone,
+                body=i18n.choose_slot_on_date(lang, date_label),
+                button_label=i18n.times_button_label(lang),
+                rows=_slot_rows_with_change_day(day_slots, lang),
+                section_title=i18n.slots_section_title(lang),
+            )
+            db.commit()
+            logger.info(
+                "[voice_fast] doctor=%s date=%s time_hint=%r → same-day slots (skip day picker)",
+                doctor.doctor_id,
+                date_key,
+                time_hint,
+            )
+            return True
+
+    from app.graph.conversation_engine import continue_after_doctor_selected
+
+    logger.info(
+        "[voice_fast] doctor=%s date/time incomplete date=%r time=%r → date picker",
+        doctor.doctor_id,
+        date_hint,
+        time_hint,
+    )
+    wa.send_text(phone, i18n.voice_continue_with_doctor(_reply_lang(phone), doctor_name))
+    continue_after_doctor_selected(db, phone=phone, doctor_id=doctor.doctor_id)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -616,19 +996,52 @@ def try_voice_midflow(
         logger.info(f"[voice_fast] midflow free-text awaiting={awaiting} phone={phone}")
         return _dispatch(db, phone, text=transcript)
 
+    # "عايز دكتور تاني / كمان عايز أحجز أعصاب": drop this draft's doctor and
+    # SHOW the (specialty) doctor list. Includes known_patient_confirm — prod
+    # kept Kareem's slots when the patient asked for neurology there.
+    _draft_review_steps = {
+        "summary",
+        "confirm",
+        "known_patient_confirm",
+        "patient_name",
+        "mrn_optional",
+        "dob_gate",
+        "dob_value",
+    }
+    if (
+        (
+            awaiting in _draft_review_steps
+            or conv_state
+            in {
+                ConversationState.CONFIRMING.value,
+                ConversationState.PATIENT_DETAILS.value,
+            }
+        )
+        and transcript
+        and (
+            _wants_other_doctor(result, transcript)
+            or (
+                _transcript_names_specialty(db, result, transcript)
+                and intent in {"book", "ask_doctors", "update", "unknown", ""}
+            )
+        )
+    ):
+        return _restart_doctor_picker(
+            db, phone=phone, conversation=conversation, result=result
+        )
+
     # A clearly *different* booking voiced while reviewing the summary / confirm
-    # step: the patient named a NEW doctor or specialty (e.g. "أحجز مع دكتور دينا
-    # حسن يوم الاتنين"). Abandon the half-finished draft and start the new booking
+    # step: the patient named a NEW doctor (e.g. "أحجز مع دكتور دينا حسن يوم
+    # الاتنين"). Abandon the half-finished draft and start the new booking
     # instead of letting the confirm/cancel matcher swallow the word "أحجز".
-    # Gated on a concrete doctor/specialty hint so a plain "نعم"/"احجز" can never
-    # hijack a genuine confirmation.
+    # Specialty-only "other doctor" requests are handled above.
     if (
         (
             awaiting in {"summary", "confirm"}
             or conv_state == ConversationState.CONFIRMING.value
         )
         and transcript
-        and (result.get("doctor_hint") or result.get("specialty_hint"))
+        and result.get("doctor_hint")
         and voice_wants_flow_switch(result)
     ):
         logger.info(
@@ -674,10 +1087,18 @@ def try_voice_midflow(
             if opt:
                 return _dispatch(db, phone, text=transcript, payload_id=opt)
             return _dispatch(db, phone, text="تأكيد")
-        if intent == "cancel" or any(
-            w in _norm_ar(transcript)
-            for w in ("الغاء", "إلغاء", "لا", "مش عايز", "cancel", "رجوع")
-        ):
+        n = _norm_ar(transcript)
+        # Bare "لا" / "مش عايز" alone can mean decline — but NOT when the sentence
+        # is about wanting a different doctor (handled above) or a specialty jump.
+        cancel_hit = intent == "cancel" or any(
+            w in n for w in ("الغاء", "إلغاء", "cancel", "رجوع")
+        ) or (
+            any(w in n for w in ("لا", "مش عايز"))
+            and not result.get("specialty_hint")
+            and not result.get("doctor_hint")
+            and not _wants_other_doctor(result, transcript)
+        )
+        if cancel_hit:
             opt = _match_last_option(sess, result)
             if opt and ("الغاء" in _norm_ar(str(opt)) or "cancel" in str(opt).lower()):
                 return _dispatch(db, phone, text=transcript, payload_id=opt)
@@ -685,6 +1106,65 @@ def try_voice_midflow(
         opt = _match_last_option(sess, result)
         if opt:
             return _dispatch(db, phone, text=transcript, payload_id=opt)
+
+    # Doctor picker order (specialty BEFORE option match):
+    # 1) real person name  2) spoken specialty  3) pick from open list
+    # Prod bug: "خلينا دكتور عيون" + selected_option_id=doctor_14 took path 3.
+    on_doctor_step = awaiting == "doctor" or (
+        conv_state == ConversationState.BOOKING_DOCTOR.value and sess.get("doctor_id") is None
+    )
+    if on_doctor_step:
+        person_hint = result.get("doctor_hint")
+        person = (
+            find_doctor_by_hint(db, DEFAULT_CLINIC_ID, str(person_hint))
+            if person_hint
+            else None
+        )
+        if person:
+            # Honor date/time in the same utterance ("كريم يوم الثلاثة الساعة 5")
+            # instead of always dumping the day picker.
+            logger.info(
+                "[voice_fast] midflow doctor=%s date=%r time=%r phone=%s",
+                person.doctor_id,
+                result.get("date_hint"),
+                result.get("time_hint"),
+                phone,
+            )
+            return _continue_booking_with_doctor(
+                db,
+                phone=phone,
+                conversation=conversation,
+                doctor=person,
+                result=result,
+                reset_session=False,
+            )
+
+        dept = _resolve_specialty_department(db, result)
+        if dept and intent in {"book", "ask_doctors", "update", "unknown", ""}:
+            if _transcript_names_specialty(db, result, transcript):
+                return _show_specialty_doctors_midflow(
+                    db, phone=phone, sess=sess, dept=dept
+                )
+
+        # No specialty switch — try the spoken transcript as a person name
+        if transcript:
+            by_voice = find_doctor_by_hint(db, DEFAULT_CLINIC_ID, transcript)
+            if by_voice:
+                logger.info(
+                    "[voice_fast] midflow doctor=%s date=%r time=%r phone=%s",
+                    by_voice.doctor_id,
+                    result.get("date_hint"),
+                    result.get("time_hint"),
+                    phone,
+                )
+                return _continue_booking_with_doctor(
+                    db,
+                    phone=phone,
+                    conversation=conversation,
+                    doctor=by_voice,
+                    result=result,
+                    reset_session=False,
+                )
 
     # Spoken option while a list/buttons are open
     opt = _match_last_option(sess, {**result, "action": action})
@@ -702,35 +1182,6 @@ def try_voice_midflow(
     ):
         logger.info(f"[voice_fast] midflow option={opt} awaiting={awaiting} phone={phone}")
         return _dispatch(db, phone, text=transcript, payload_id=opt)
-
-    # Doctor picker step — speak a doctor name
-    if awaiting == "doctor" or (
-        conv_state == ConversationState.BOOKING_DOCTOR.value and sess.get("doctor_id") is None
-    ):
-        hint = result.get("doctor_hint") or transcript
-        doctor = find_doctor_by_hint(db, DEFAULT_CLINIC_ID, str(hint) if hint else None)
-        if doctor:
-            from app.graph.conversation_engine import continue_after_doctor_selected
-
-            logger.info(f"[voice_fast] midflow doctor={doctor.doctor_id} phone={phone}")
-            continue_after_doctor_selected(db, phone=phone, doctor_id=doctor.doctor_id)
-            return True
-        # Specialty spoken while on doctor path
-        dept = _resolve_specialty_department(db, result)
-        if dept and intent in {"book", "ask_doctors", "unknown", ""}:
-            from app.graph.conversation_engine import _show_doctor_cards
-
-            sess["department_id"] = dept.department_id
-            sess["awaiting"] = "doctor"
-            wa.send_text(
-                phone,
-                i18n.voice_specialty_open_doctors(
-                    _reply_lang(phone), dept.name_ar or dept.name_en or ""
-                ),
-            )
-            return bool(
-                _show_doctor_cards(phone, db, dept.department_id)
-            )
 
     # Department list — speak specialty
     if awaiting == "department":
@@ -846,9 +1297,6 @@ def try_voice_book_direct(
     """Doctor (+ optional date/time) → hold or date/slot picker. Never auto-confirms."""
     action = (result.get("action") or "").strip().lower()
     doctor_hint = result.get("doctor_hint")
-    date_hint = result.get("date_hint")
-    time_hint = result.get("time_hint")
-    transcript = (result.get("transcript") or result.get("text") or "").strip()
     confidence = float(result.get("confidence") or 0)
     intent = (result.get("intent") or "").strip().lower()
 
@@ -883,141 +1331,14 @@ def try_voice_book_direct(
         clinic_id=DEFAULT_CLINIC_ID,
         phone=phone,
     )
-    sess = _sess(phone)
-    # Preserve voice hints only
-    hints = {
-        k: sess.get(k)
-        for k in (
-            "voice_doctor_hint",
-            "voice_specialty_hint",
-            "voice_date_hint",
-            "voice_time_hint",
-            "voice_transcript",
-        )
-        if sess.get(k)
-    }
-    sess.clear()
-    sess.update(hints)
-    sess["flow"] = "booking"
-    sess["doctor_id"] = doctor.doctor_id
-
-    doctor_name = doctor.name_ar or doctor.name_en or str(doctor.doctor_id)
-    booking_service.release_expired_holds(db, clinic_id=DEFAULT_CLINIC_ID)
-    avail = booking_service.get_available_dates_and_slots(
-        db, doctor_id=doctor.doctor_id, clinic_id=DEFAULT_CLINIC_ID
+    return _continue_booking_with_doctor(
+        db,
+        phone=phone,
+        conversation=conversation,
+        doctor=doctor,
+        result=result,
+        reset_session=True,
     )
-    dates = avail.get("dates") or {}
-
-    matched = match_slot(
-        dates,
-        date_hint=date_hint,
-        time_hint=time_hint,
-        transcript=transcript,
-    )
-    if matched:
-        slot_id = int(matched.get("slot_id") or matched.get("id") or 0)
-        if not slot_id:
-            return False
-        try:
-            booking_service.hold_slot(
-                db,
-                slot_id=slot_id,
-                clinic_id=DEFAULT_CLINIC_ID,
-                held_by_phone=phone,
-                hold_minutes=SLOT_HOLD_MINUTES,
-            )
-        except BookingError as exc:
-            wa.send_text(
-                phone,
-                f"وجدت د. {doctor_name} لكن الوقت غير متاح حالياً ({exc}). اختر يوماً آخر.",
-            )
-            matched = None
-        else:
-            sess["slot_id"] = slot_id
-            start = matched.get("slot_start") or matched.get("start")
-            when = (
-                start.strftime("%Y-%m-%d %H:%M")
-                if isinstance(start, datetime)
-                else str(start)
-            )
-            set_conversation_state(
-                db,
-                conversation,
-                ConversationState.PATIENT_DETAILS,
-                current_intent="voice_book_direct",
-            )
-            sess["awaiting"] = "patient_name"
-            sess.pop("last_options", None)
-            wa.send_text(
-                phone,
-                (
-                    f"تمام — حجز مؤقت مع {doctor_name}\n"
-                    f"الموعد: {when}\n\n"
-                    "برجاء إدخال اسم المريض لإكمال التأكيد:"
-                ),
-            )
-            db.commit()
-            logger.info(
-                f"[voice_fast] held slot_id={slot_id} doctor={doctor.doctor_id} phone={phone}"
-            )
-            return True
-
-    # Day resolved (with or without time) but exact slot not held → that day's slots only.
-    # Do NOT require `not time_hint`: a spoken time that misses a free slot must still
-    # narrow to the resolved day instead of collapsing to the full date picker.
-    date_key = resolve_date_key(
-        date_hint=date_hint,
-        transcript=transcript,
-        available=set(dates.keys()) if dates else None,
-    )
-    if date_key and date_key in dates:
-        from app.graph.conversation_engine import (
-            _date_option_title,
-            _lang,
-            _offer_list,
-            _slot_rows_with_change_day,
-        )
-
-        day_slots = dates.get(date_key) or []
-        if day_slots:
-            sess["selected_date"] = date_key
-            set_conversation_state(
-                db,
-                conversation,
-                ConversationState.BOOKING_SLOT,
-                current_intent="voice_book_date",
-            )
-            lang = _lang(conversation)
-            date_label = _date_option_title(date_key, lang)
-            _offer_list(
-                phone,
-                body=i18n.choose_slot_on_date(lang, date_label),
-                button_label=i18n.times_button_label(lang),
-                rows=_slot_rows_with_change_day(day_slots, lang),
-                section_title=i18n.slots_section_title(lang),
-            )
-            db.commit()
-            logger.info(
-                "[voice_fast] doctor=%s date=%s time_hint=%r → same-day slots",
-                doctor.doctor_id,
-                date_key,
-                time_hint,
-            )
-            return True
-
-    from app.graph.conversation_engine import continue_after_doctor_selected
-
-    logger.info(
-        "[voice_fast] doctor=%s date/time incomplete date=%r time=%r "
-        "normalized_date=%r → date picker",
-        doctor.doctor_id,
-        date_hint,
-        time_hint,
-        _normalize_date_hint(date_hint),
-    )
-    wa.send_text(phone, i18n.voice_continue_with_doctor(_reply_lang(phone), doctor_name))
-    continue_after_doctor_selected(db, phone=phone, doctor_id=doctor.doctor_id)
-    return True
 
 
 def try_voice_specialty_direct(
@@ -1068,7 +1389,24 @@ def try_voice_specialty_direct(
     }
     sess.clear()
     sess.update(hints)
-    flow = "inquiry" if intent == "ask_doctors" else "booking"
+    transcript_n = _norm_ar(result.get("transcript") or result.get("text") or "")
+    # "عايز أحجز مع دكتور قلب" / "دكتور قلب تاني" are booking picks, not a
+    # browse-only inquiry — even if the router labelled intent=ask_doctors.
+    booking_words = (
+        "احجز",
+        "حجز",
+        "عايز",
+        "احتاج",
+        "book",
+        "تاني",
+        "ثاني",
+        "another",
+        "other",
+    )
+    force_booking = action == "specialty_direct" and any(
+        w in transcript_n for w in booking_words
+    )
+    flow = "inquiry" if (intent == "ask_doctors" and not force_booking) else "booking"
     sess["flow"] = flow
     sess["department_id"] = dept.department_id
     sess["awaiting"] = "doctor"
@@ -1090,6 +1428,7 @@ def try_voice_specialty_direct(
         else (dept.name_ar or dept.name_en)
     ) or ""
     wa.send_text(phone, i18n.voice_specialty_open_doctors(_lng, dept_name))
+    # Always show the list — never auto-pick a doctor for "دكتور قلب".
     ok = _show_doctor_cards(
         phone,
         db,

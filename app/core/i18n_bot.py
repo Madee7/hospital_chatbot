@@ -1111,6 +1111,17 @@ def voice_continue_with_doctor(lang: Any, doctor_name: str) -> str:
     return f"حسناً — متابعة الحجز مع {doctor_name}."
 
 
+def voice_pick_another_doctor(lang: Any, dept_name: str | None = None) -> str:
+    """Patient asked to change doctor mid-draft — show the doctor list again."""
+    if is_english(lang):
+        if dept_name:
+            return f"No problem — pick another {dept_name} doctor:"
+        return "No problem — pick another doctor:"
+    if dept_name:
+        return f"تمام — اختار دكتور تاني من تخصص {dept_name}:"
+    return "تمام — اختار دكتور تاني:"
+
+
 def no_slots_on_day(lang: Any) -> str:
     if is_english(lang):
         return "No times on that day. Please choose another day."
@@ -1550,6 +1561,103 @@ def not_understood_menu(lang: Any) -> str:
     if is_english(lang):
         return "Sorry, I didn't quite catch that. Here's what I can help with:"
     return "معلش، مفهمتش قصدك بالظبط. دي الخدمات اللي أقدر أساعدك فيها:"
+
+
+# --- Router V2 degradation messages -----------------------------------------
+# The executor may only downgrade a step if it tells the patient why. Each of
+# these pairs with one rung of the ladder in app/services/voice_executor.py, so
+# a request that can't be fulfilled never silently turns into the main menu.
+
+
+def voice_doctor_not_found(lang: Any, spoken_name: str) -> str:
+    """Named doctor couldn't be resolved → show the doctor list instead."""
+    if is_english(lang):
+        return (
+            f"I couldn't find a doctor named \"{spoken_name}\". "
+            "Here are our available doctors — pick one:"
+        )
+    return f"مش لاقي دكتور بإسم \"{spoken_name}\". دول الأطباء المتاحين — اختر منهم:"
+
+
+def voice_specialty_not_found(lang: Any, spoken_name: str) -> str:
+    if is_english(lang):
+        return (
+            f"I couldn't match \"{spoken_name}\" to one of our departments. "
+            "Here's what we have:"
+        )
+    return f"مش لاقي تخصص بإسم \"{spoken_name}\". دي التخصصات المتاحة:"
+
+
+def voice_slot_taken(lang: Any, doctor_name: str, date_label: str) -> str:
+    """Requested exact time was gone → show the rest of that day."""
+    if is_english(lang):
+        return (
+            f"That time with {doctor_name} was just taken. "
+            f"Here are the other times on {date_label}:"
+        )
+    return f"الوقت ده مع {doctor_name} اتحجز للأسف. دي باقي المواعيد يوم {date_label}:"
+
+
+def voice_time_not_available(lang: Any, date_label: str) -> str:
+    """Spoken time didn't match any free slot → show that day's slots."""
+    if is_english(lang):
+        return f"I couldn't find that exact time. Here's what's open on {date_label}:"
+    return f"مفيش الميعاد ده بالظبط. دي المواعيد المتاحة يوم {date_label}:"
+
+
+def voice_no_slots_on_date(lang: Any, doctor_name: str, date_label: str) -> str:
+    """Nothing free on the requested day → back to the day picker."""
+    if is_english(lang):
+        return (
+            f"{doctor_name} has no openings on {date_label}. "
+            "Pick another day:"
+        )
+    return f"مفيش مواعيد متاحة مع {doctor_name} يوم {date_label}. اختر يوم تاني:"
+
+
+def voice_doctor_fully_booked(lang: Any, doctor_name: str) -> str:
+    if is_english(lang):
+        return (
+            f"{doctor_name} has no available appointments right now. "
+            "Here are other doctors you can book with:"
+        )
+    return f"مفيش مواعيد متاحة مع {doctor_name} حالياً. دي أطباء تانية تقدر تحجز معاهم:"
+
+
+def voice_no_appointment_found(lang: Any) -> str:
+    """Cancel/reschedule asked for, but this phone has no booking."""
+    if is_english(lang):
+        return "I don't see any upcoming appointment booked under this number."
+    return "مش لاقي أي موعد قادم محجوز على الرقم ده."
+
+
+def voice_draft_abandoned(lang: Any) -> str:
+    """abandon_draft — distinct from cancelling a real appointment."""
+    if is_english(lang):
+        return "No problem, I've stopped that booking. Nothing was confirmed."
+    return "تمام، وقفت الحجز ده. مفيش حاجة اتأكدت."
+
+
+def voice_slot_held(lang: Any, doctor_name: str, when: str) -> str:
+    """Exact time reserved from a voice note → ask for the patient's name."""
+    if is_english(lang):
+        return (
+            f"Done — I'm holding a slot with {doctor_name}\n"
+            f"Appointment: {when}\n\n"
+            "Please send the patient's name to confirm:"
+        )
+    return (
+        f"تمام — حجز مؤقت مع {doctor_name}\n"
+        f"الموعد: {when}\n\n"
+        "برجاء إدخال اسم المريض لإكمال التأكيد:"
+    )
+
+
+def voice_need_doctor_first(lang: Any) -> str:
+    """Plan asked for a date/time step before any doctor was chosen."""
+    if is_english(lang):
+        return "Let's pick the doctor first, then I'll show you the available times."
+    return "نختار الدكتور الأول، وبعدها أعرض لك المواعيد المتاحة."
 
 
 def stale_option_hint(lang: Any) -> str:

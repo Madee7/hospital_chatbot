@@ -219,10 +219,53 @@ def _detect_by_lingua(text: str) -> LangCode | None:
     return None
 
 
+# Whisper often invents outros / Islamic greetings / MSA when speech is unclear.
+# These must not drive booking or language switches.
+_WHISPER_HALLUCINATION_CHUNK_RE = re.compile(
+    r"("
+    r"نهاية\s*(?:ال)?(?:تسجيل|زياده|زيادة)?"
+    r"|(?:ال)?سلام\s+عليكم(?:\s+و?رحم[ةه]?\s+الله)?(?:\s+وبركاته)?"
+    r"|وعليكم\s+السلام"
+    r"|أريد\s+أن\s+أقوم(?:\s+\S+){0,6}"
+    r"|مجلس\s+الدين"
+    r"|شكراً?\s+لكم\s+على\s+المشاهدة"
+    r"|أعزائي\s+الجميع"
+    r"|thanks\s+for\s+watching"
+    r"|subscribe\s+to(?:\s+\S+){0,4}"
+    r"|as\-?salamu?\s+alaykum(?:\s+\S+){0,6}"
+    r")",
+    re.I,
+)
+
+
+def scrub_whisper_hallucinations(text: str | None) -> str:
+    """Strip known Whisper hallucination chunks; return leftover real speech."""
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    cleaned = _WHISPER_HALLUCINATION_CHUNK_RE.sub(" ", raw)
+    cleaned = re.sub(r"[\s،,.;:!?]+", " ", cleaned).strip()
+    return cleaned
+
+
+def is_whisper_garbage(text: str | None) -> bool:
+    """True when the transcript is empty or only Whisper hallucination fluff."""
+    raw = (text or "").strip()
+    if not raw:
+        return True
+    leftover = scrub_whisper_hallucinations(raw)
+    if not leftover:
+        return True
+    # Mostly fluff with a tiny leftover fragment (1–2 short tokens).
+    if len(leftover) < 4 and _WHISPER_HALLUCINATION_CHUNK_RE.search(raw):
+        return True
+    return False
+
+
 def is_confident_switch(text: str, detected: LangCode) -> bool:
     """Extra gate before flipping an already-set conversation language."""
     raw = (text or "").strip()
-    if not raw or is_non_linguistic(raw):
+    if not raw or is_non_linguistic(raw) or is_whisper_garbage(raw):
         return False
     if detected == "ar":
         return _has_real_arabic_words(raw)

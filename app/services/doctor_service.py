@@ -17,8 +17,36 @@ _SPECIALTY_ALIASES: dict[str, tuple[str, ...]] = {
     "عيون": ("عيون", "عين", "ophthalmology", "eye"),
     "أسنان": ("أسنان", "سن", "dentistry", "dental", "dentist"),
     "باطنة": ("باطنة", "باطني", "internal medicine", "internal"),
-    "أعصاب": ("أعصاب", "neurology", "neuro"),
-    "نساء": ("نساء", "توليد", "نسا", "obgyn", "gynecology", "gynaecology"),
+    "أعصاب": (
+        "أعصاب",
+        "عصاب",
+        "اعصاب",
+        "أصاب",  # Whisper often writes أعصاب as أصاب
+        "اصاب",
+        "عنايزة",
+        "اسااب",
+        "neurology",
+        "neuro",
+        "asaab",
+        "asab",
+    ),
+    "نساء": (
+        "نساء",
+        "توليد",
+        "نسا",
+        "نيسا",  # Whisper often writes نسا as نيسا
+        "تسا",
+        "تساء",
+        "النسا",
+        "النساء",
+        "نساء وتوليد",
+        "النساء والتوليد",
+        "نسا وتوليد",
+        "obgyn",
+        "ob/gyn",
+        "gynecology",
+        "gynaecology",
+    ),
 }
 
 
@@ -33,8 +61,13 @@ def specialty_alias_words() -> set[str]:
 
 def is_specialty_word(text: str | None) -> bool:
     """True if text (after stripping دكتور/dr) matches a known specialty alias."""
+    return fuzzy_specialty_canonical(text) is not None
+
+
+def fuzzy_specialty_canonical(text: str | None) -> str | None:
+    """Return canonical specialty for exact or near-miss aliases (عصاب→أعصاب)."""
     if not text or not str(text).strip():
-        return False
+        return None
     stripped = re.sub(
         r"^(د\.|دكتور|الدكتور|dr\.?)\s*",
         "",
@@ -42,12 +75,43 @@ def is_specialty_word(text: str | None) -> bool:
         flags=re.I,
     ).strip()
     if not stripped:
-        return False
+        return None
     needle = _norm_ar(stripped)
-    for word in specialty_alias_words():
-        if needle == _norm_ar(word):
-            return True
-    return False
+    needle_al = _strip_al(needle)
+
+    def _edit_dist(a: str, b: str) -> int:
+        if a == b:
+            return 0
+        if abs(len(a) - len(b)) > 1:
+            return 99
+        if len(a) < len(b):
+            a, b = b, a
+        # a longer by at most 1, or same length
+        if len(a) == len(b):
+            return sum(x != y for x, y in zip(a, b))
+        for i in range(len(a)):
+            if a[:i] + a[i + 1 :] == b:
+                return 1
+        return 99
+
+    # Pass 1: exact (incl. leading-alef variants) — عصاب must hit أعصاب, not عظام.
+    exact_hit: str | None = None
+    near_hit: str | None = None
+    near_dist = 99
+    for canonical, aliases in _SPECIALTY_ALIASES.items():
+        for word in (canonical, *aliases):
+            w = _norm_ar(word)
+            w_al = _strip_al(w)
+            if needle == w or needle_al == w_al or needle.lstrip("ا") == w.lstrip("ا"):
+                exact_hit = canonical
+                break
+            d = min(_edit_dist(needle, w), _edit_dist(needle_al, w_al))
+            if d <= 1 and d < near_dist:
+                near_dist = d
+                near_hit = canonical
+        if exact_hit:
+            break
+    return exact_hit or near_hit
 
 
 def _norm_ar(text: str) -> str:
@@ -145,7 +209,21 @@ def find_department(
         if cleaned in candidates:
             return dept
 
-    # Alias table (قلب → Cardiology, etc.) — whole-word match only
+    # Alias table (قلب → Cardiology, etc.) — whole-word + fuzzy near-miss
+    fuzzy_canonical = fuzzy_specialty_canonical(cleaned)
+    if fuzzy_canonical:
+        for _canonical, aliases in _SPECIALTY_ALIASES.items():
+            if _canonical != fuzzy_canonical and fuzzy_canonical not in aliases:
+                continue
+            for dept in departments:
+                blob = _dept_blob(dept)
+                if any(_word_match(blob, a) for a in aliases) or _word_match(
+                    blob, fuzzy_canonical
+                ):
+                    return dept
+        # Fall through to name-based match using the canonical form
+        cleaned = _norm_ar(fuzzy_canonical)
+
     for _canonical, aliases in _SPECIALTY_ALIASES.items():
         if any(_word_match(cleaned, a) for a in aliases):
             for dept in departments:

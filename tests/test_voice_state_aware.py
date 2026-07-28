@@ -81,6 +81,7 @@ def test_build_stt_context_prompt_from_doctors_and_departments():
     doc = SimpleNamespace(name_ar="د. منى محمد", name_en="Mona Mohamed")
     dept = SimpleNamespace(name_ar="قلب", name_en="Cardiology")
     with (
+        patch("app.core.config.VOICE_STT_PROMPT", True),
         patch("app.services.doctor_service.list_active_doctors", return_value=[doc]),
         patch("app.services.doctor_service.list_departments", return_value=[dept]),
     ):
@@ -91,6 +92,7 @@ def test_build_stt_context_prompt_from_doctors_and_departments():
 
     # Cache hit — second call must not re-query
     with (
+        patch("app.core.config.VOICE_STT_PROMPT", True),
         patch("app.services.doctor_service.list_active_doctors") as list_docs,
         patch("app.services.doctor_service.list_departments") as list_depts,
     ):
@@ -98,6 +100,14 @@ def test_build_stt_context_prompt_from_doctors_and_departments():
     assert again == prompt
     list_docs.assert_not_called()
     list_depts.assert_not_called()
+
+
+def test_build_stt_context_prompt_off_by_default():
+    """Quality default: no Whisper prompt (matches early working path)."""
+    voice_service.clear_stt_prompt_cache()
+    db = MagicMock()
+    with patch("app.core.config.VOICE_STT_PROMPT", False):
+        assert voice_service._build_stt_context_prompt(db, clinic_id=1) == ""
 
 
 def test_transcribe_ogg_passes_prompt_to_whisper():
@@ -112,16 +122,35 @@ def test_transcribe_ogg_passes_prompt_to_whisper():
         patch.object(
             voice_service,
             "_build_stt_context_prompt",
-            return_value="د. منى محمد، قلب، Cardiology",
+            return_value="د. منى محمد، قلب",
         ),
         patch.object(voice_service, "_with_retries", side_effect=lambda _l, fn: fn()),
     ):
         text = voice_service._transcribe_ogg(b"ogg-bytes", db=db, clinic_id=1)
     assert text == "عايز دكتورة منى"
     kwargs = fake_client.audio.transcriptions.create.call_args.kwargs
-    assert kwargs["prompt"] == "د. منى محمد، قلب، Cardiology"
-    # Language must NOT be forced — Whisper auto-detects so English speech
-    # isn't mangled into Arabic script before GPT routing.
+    assert kwargs["prompt"] == "د. منى محمد، قلب"
+    # Always auto-detect — never pin language (hurts Egyptian dialect).
+    assert "language" not in kwargs
+
+
+def test_transcribe_ogg_ignores_force_language():
+    """force_language must not pin Whisper — live logs showed ar-force hallucinations."""
+    voice_service.clear_stt_prompt_cache()
+    fake_client = MagicMock()
+    fake_client.audio.transcriptions.create.return_value = SimpleNamespace(
+        text="عايز دكتور قلب"
+    )
+    with (
+        patch.object(voice_service, "_client", return_value=fake_client),
+        patch.object(voice_service, "_build_stt_context_prompt", return_value=""),
+        patch.object(voice_service, "_with_retries", side_effect=lambda _l, fn: fn()),
+    ):
+        text = voice_service._transcribe_ogg(
+            b"ogg-bytes", db=None, force_language="en"
+        )
+    assert text == "عايز دكتور قلب"
+    kwargs = fake_client.audio.transcriptions.create.call_args.kwargs
     assert "language" not in kwargs
 
 
@@ -131,7 +160,7 @@ def test_transcribe_ogg_passes_prompt_to_whisper():
 
 
 def _mock_conversation():
-    return SimpleNamespace(conversation_id=1, state=None)
+    return SimpleNamespace(conversation_id=1, state=None, language=None)
 
 
 def test_webhook_clarify_with_doctor_hint_reaches_fastpath():

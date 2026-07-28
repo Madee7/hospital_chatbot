@@ -21,10 +21,12 @@ from app.core.config import (
     OPENAI_MODEL,
     OPENAI_STT_MODEL,
     OPENAI_VOICE_STRUCTURE_MODEL,
+    VOICE_ROUTER_V2,
     WHATSAPP_API_VERSION,
     WHATSAPP_TOKEN,
 )
-from app.services.voice_schemas import VoiceUnderstanding
+from app.services.voice_prompts import PLANNER_SYSTEM
+from app.services.voice_schemas import VoicePlan, VoiceUnderstanding
 # TODO: prefer DB-driven matching via doctor_service.infer_department_from_text(clinic_id)
 # once a Session/clinic_id is threaded into _sanitize (option b). For now aliases stay
 # in doctor_service._SPECIALTY_ALIASES as the single source of truth.
@@ -39,7 +41,7 @@ T = TypeVar("T")
 # In-process Whisper vocabulary prompt cache: clinic_id → (expires_at, prompt)
 _STT_PROMPT_CACHE: dict[int, tuple[float, str]] = {}
 _STT_PROMPT_TTL_SEC = 600.0  # 10 minutes
-_STT_PROMPT_MAX_CHARS = 800
+_STT_PROMPT_MAX_CHARS = 500
 
 _SYSTEM = """You are an intelligent router for New Giza University Hospital's WhatsApp chatbot.
 Patients speak Egyptian Arabic. Your job is to extract maximum information and route efficiently.
@@ -242,6 +244,7 @@ what was actually said.
   even when action="clarify".
 Language detection is INDEPENDENT of the hints: keep doctor_hint/specialty_hint in
 the same language they were spoken (do not translate an English name into Arabic).
+If THIS turn is English, language MUST be "en" even when the previous turn was Arabic.
 summary_ar is always written in Arabic regardless of 'language'.
 
 ========================================================================
@@ -255,7 +258,7 @@ KEY EXTRACTION CASES
 - Nickname/partial name ("محمد"): keep as doctor_hint; backend resolves the full name.
 - Cancel mid-flow ("خلاص ماحتاجش"/"الغي الحجز"/"بطل"): intent="cancel" (or "menu").
 
-Keep transcript in Arabic. Never invent option ids."""
+Keep transcript in the language spoken. Never invent option ids."""
 
 # Retry: 2 attempts, backoff 1s then 3s (Task 1)
 _RETRY_BACKOFFS = (1.0, 3.0)
@@ -299,6 +302,7 @@ def _clarify_dict(
         "media_id": media_id,
         "cost": None,
         "understanding": understanding,
+        "plan": None,
     }
 
 
@@ -476,8 +480,15 @@ def _build_stt_context_prompt(
     *,
     now: float | None = None,
 ) -> str:
-    """Short Whisper vocabulary bias: active doctor + department names/aliases."""
-    if db is None:
+    """Optional Whisper vocabulary bias — OFF by default for maximum quality.
+
+    Dumping doctor/specialty lists into ``prompt`` biased Whisper toward
+    invented names and dual-script lines. The early working path used no
+    prompt. Set VOICE_STT_PROMPT=true only if you need name biasing again.
+    """
+    from app.core.config import VOICE_STT_PROMPT
+
+    if not VOICE_STT_PROMPT or db is None:
         return ""
     cid = int(clinic_id if clinic_id is not None else DEFAULT_CLINIC_ID)
     ts = time.time() if now is None else now
@@ -489,32 +500,29 @@ def _build_stt_context_prompt(
 
     parts: list[str] = [
         "مستشفى جامعة الجيزة الجديدة.",
-        "أسماء الأطباء والتخصصات:",
+        "قلب، عيون، أسنان، أعصاب، أطفال، عظام، جلدية، باطنة، نساء.",
     ]
     try:
         doctors = doctor_service.list_active_doctors(db, cid, limit=40)
+        name_bits: list[str] = []
         for doc in doctors:
-            names = [n for n in (doc.name_ar, doc.name_en) if n and str(n).strip()]
-            if names:
-                parts.append("، ".join(dict.fromkeys(names)))
-        departments = doctor_service.list_departments(db, cid)
-        dept_bits: list[str] = []
-        for dept in departments:
-            for n in (dept.name_ar, dept.name_en):
-                if n and str(n).strip():
-                    dept_bits.append(str(n).strip())
-        # Prefer short aliases; skip long descriptions
+            ar = (doc.name_ar or "").strip()
+            en = (doc.name_en or "").strip()
+            if ar:
+                name_bits.append(ar)
+            elif en:
+                name_bits.append(en)
+        if name_bits:
+            parts.append("، ".join(dict.fromkeys(name_bits)))
         for word in sorted(specialty_alias_words(), key=len):
-            if len(word) <= 24:
-                dept_bits.append(word)
-        if dept_bits:
-            # de-dupe preserving order
-            parts.append("، ".join(dict.fromkeys(dept_bits)))
+            if word.isascii() or len(word) > 24:
+                continue
+            parts.append(word)
     except Exception:
         logger.exception("[voice] failed building STT context prompt clinic_id=%s", cid)
         return ""
 
-    prompt = " ".join(parts)
+    prompt = " ".join(dict.fromkeys(parts))
     if len(prompt) > _STT_PROMPT_MAX_CHARS:
         prompt = prompt[: _STT_PROMPT_MAX_CHARS].rsplit("،", 1)[0].strip()
     _STT_PROMPT_CACHE[cid] = (ts + _STT_PROMPT_TTL_SEC, prompt)
@@ -604,7 +612,16 @@ def _transcribe_ogg(
     *,
     db: Session | None = None,
     clinic_id: int | None = None,
+    force_language: str | None = None,
 ) -> str:
+    """Bare Whisper transcription — no language pin, prompt optional/off.
+
+    Early production quality used plain whisper-1. Forcing ``language`` and
+    heavy ``prompt`` vocab caused the recent hallucinations. ``force_language``
+    is ignored for quality.
+    """
+    del force_language  # intentionally unused
+
     def _do() -> str:
         client = _client()
         stt_prompt = _build_stt_context_prompt(db, clinic_id)
@@ -613,9 +630,6 @@ def _transcribe_ogg(
             tmp_path = tmp.name
         try:
             with open(tmp_path, "rb") as audio_file:
-                # No forced `language`: patients speak Egyptian Arabic *or* English
-                # (often code-switched). Whisper auto-detects reliably; forcing "ar"
-                # mangled English speech into Arabic script before GPT ever saw it.
                 kwargs: dict[str, Any] = {
                     "model": OPENAI_STT_MODEL,
                     "file": audio_file,
@@ -698,28 +712,145 @@ def _understand_via_gpt_text(
     return _with_retries("openai_voice_parse", _do)
 
 
+def _plan_via_gpt_text(
+    transcript: str,
+    options: list[Option] | None,
+    current_step: dict[str, Any] | None = None,
+) -> tuple[VoicePlan, dict[str, int]]:
+    """Router V2: ask the model for a flow plan instead of a classification.
+
+    Returns (plan, token_usage). The plan is deliberately NOT sanitized here —
+    validating it against real availability is voice_executor's job, and
+    rewriting it in advance is exactly the second-guessing V2 removes.
+    """
+
+    def _do() -> tuple[VoicePlan, dict[str, int]]:
+        client = _client()
+        parse_fn = (
+            getattr(client.chat.completions, "parse", None)
+            or client.beta.chat.completions.parse
+        )
+        catalog = _options_catalog(options)
+        from datetime import date as _date
+
+        today = _date.today()
+        completion = parse_fn(
+            model=OPENAI_VOICE_STRUCTURE_MODEL or OPENAI_MODEL,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": PLANNER_SYSTEM},
+                {
+                    "role": "user",
+                    "content": (
+                        f"TODAY={today.isoformat()} (weekday={today.strftime('%A')})\n"
+                        f"CURRENT_STEP={json.dumps(current_step or {}, ensure_ascii=False)}\n"
+                        f"OPTIONS_JSON={json.dumps(catalog, ensure_ascii=False)}\n"
+                        f"TRANSCRIPT: {transcript}\n"
+                        "Return the structured VoicePlan."
+                    ),
+                },
+            ],
+            response_format=VoicePlan,
+        )
+        usage = voice_cost.usage_from_completion(completion)
+        parsed = completion.choices[0].message.parsed
+        if parsed is None:
+            return (
+                VoicePlan(
+                    transcript=transcript,
+                    goal="unclear",
+                    next_step="clarify",
+                    summary_ar="لم أفهم الطلب بوضوح",
+                    summary_en="Could not understand the request.",
+                    language="ar",
+                ),
+                usage,
+            )
+        return parsed.model_copy(update={"transcript": transcript or parsed.transcript}), usage
+
+    plan, usage = _with_retries("openai_voice_plan", _do)
+    return _align_language_to_transcript(plan, transcript), usage
+
+
+def _align_language_to_transcript(plan: VoicePlan, transcript: str) -> VoicePlan:
+    """Force plan.language from transcript script each turn.
+
+    - English transcript + Arabic specialty/CURRENT_STEP → model wrongly said ar-EG
+    - Arabic transcript after an English session → must flip back to ar (not stick on en)
+    """
+    from app.language.language_detector import detect_language
+    from app.services.voice_schemas import fold_language
+
+    detected = detect_language(transcript, fallback=None)
+    if detected not in {"ar", "en"}:
+        return plan
+    current = fold_language(plan.language)
+    if current == detected:
+        return plan
+    wanted = "en" if detected == "en" else "ar-EG"
+    logger.info(
+        "[voice] language override %s → %s (transcript script)",
+        plan.language,
+        wanted,
+    )
+    return plan.model_copy(update={"language": wanted})
+
+
 def route_whatsapp_voice_message(
     media_id: str,
     options: list[Option] | None = None,
     current_step: dict[str, Any] | None = None,
     db: Session | None = None,
     clinic_id: int | None = None,
+    force_stt_language: str | None = None,
 ) -> dict:
     """
     Whisper (or gpt-4o-*-transcribe) → LLM Pydantic routing decision.
 
     Never uses Groq. On final external-call failure, returns clarify fallback
     (same shape as empty transcript) so webhook can degrade gracefully.
+
+    force_stt_language: optional "ar"/"en" to pin Whisper while voice language
+    is sticky mid-booking (prevents cross-language translation).
     """
     provider = f"openai_stt:{OPENAI_STT_MODEL}+gpt_parse"
     cid = clinic_id if clinic_id is not None else DEFAULT_CLINIC_ID
     chat_model = OPENAI_VOICE_STRUCTURE_MODEL or OPENAI_MODEL
     audio_seconds: float | None = None
     usage: dict[str, int] = {"prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0}
+    plan: VoicePlan | None = None
     try:
         ogg_bytes = _download_whatsapp_audio(media_id)
         audio_seconds = voice_cost.estimate_audio_seconds(ogg_bytes)
-        transcript = _transcribe_ogg(ogg_bytes, db=db, clinic_id=cid)
+        transcript = _transcribe_ogg(
+            ogg_bytes,
+            db=db,
+            clinic_id=cid,
+            force_language=force_stt_language,
+        )
+        # Drop Whisper outros / fake greetings before the planner sees them.
+        from app.language.language_detector import (
+            is_whisper_garbage,
+            scrub_whisper_hallucinations,
+        )
+
+        raw_transcript = transcript
+        if transcript and is_whisper_garbage(transcript):
+            logger.info(
+                "[voice] whisper hallucination scrubbed → clarify raw=%r",
+                raw_transcript,
+            )
+            transcript = ""
+        elif transcript:
+            scrubbed = scrub_whisper_hallucinations(transcript)
+            if scrubbed != transcript:
+                logger.info(
+                    "[voice] whisper hallucination trimmed %r → %r",
+                    transcript,
+                    scrubbed,
+                )
+                transcript = scrubbed
+
         if not transcript:
             understanding = VoiceUnderstanding(
                 transcript="",
@@ -729,6 +860,13 @@ def route_whatsapp_voice_message(
                 summary_ar="لم يصل صوت واضح",
                 language="unknown",
             )
+        elif VOICE_ROUTER_V2:
+            plan, usage = _plan_via_gpt_text(
+                transcript, options, current_step=current_step
+            )
+            # Project onto V1 so the legacy fastpath stays available as a
+            # fallback when the executor declines a step.
+            understanding = _sanitize(plan.to_understanding(), options)
         else:
             understanding, usage = _understand_via_gpt_text(
                 transcript, options, current_step=current_step
@@ -773,6 +911,30 @@ def route_whatsapp_voice_message(
         (current_step or {}).get("awaiting"),
         understanding.transcript,
     )
+    if plan is not None:
+        logger.info(
+            "[voice][v2] plan goal=%s next_step=%s doctor=%r alts=%r specialty=%r "
+            "date=%r(%s) time=%r patient=%r ref=%r change=%r option=%r "
+            "conf=%.2f(doc=%s date=%s time=%s) followup=%s lang=%s",
+            plan.goal,
+            plan.next_step,
+            plan.slots.doctor_name,
+            plan.slots.doctor_alternatives,
+            plan.slots.specialty,
+            plan.slots.date,
+            plan.slots.date_flexibility,
+            plan.slots.time,
+            plan.slots.patient_name,
+            plan.slots.appointment_ref,
+            plan.slots.change_target,
+            plan.slots.selected_option_id,
+            plan.confidence.overall,
+            plan.confidence.doctor,
+            plan.confidence.date,
+            plan.confidence.time,
+            plan.followup_goal,
+            plan.language,
+        )
     logger.info("[voice][cost] %s", voice_cost.format_cost_log(cost))
 
     return {
@@ -793,6 +955,7 @@ def route_whatsapp_voice_message(
         "media_id": media_id,
         "cost": cost,
         "understanding": understanding,
+        "plan": plan,
     }
 
 

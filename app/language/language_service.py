@@ -6,17 +6,20 @@ Detects language from every inbound user message, persists it on
 
 from __future__ import annotations
 
+import time
 from typing import Any, Literal
 
 from sqlalchemy.orm import Session
 
 from app.core import i18n_bot as i18n
+from app.core.config import VOICE_LANG_SESSION_MINUTES
 from app.db.enums import Language
 from app.language.language_detector import (
     detect_language,
     is_confident_switch,
     is_non_linguistic,
     is_ui_payload,
+    is_whisper_garbage,
 )
 from app.models.conversation_models import Conversation
 from app.services.conversation_service import set_conversation_language
@@ -60,7 +63,57 @@ class LanguageService:
         set_conversation_language(self.db, self.conversation, enum_val)
         self.session["language"] = code
         self.session.pop("language_changed", None)
+        # Track last confident voice/text language for TTL / activity only.
+        # Never used to pin Whisper (forcing STT destroys Egyptian dialect quality).
+        self.session["voice_lang_locked"] = True
+        self.session["voice_lang_locked_at"] = time.time()
+        self.session.pop("allow_voice_lang_switch", None)
         return code
+
+    def _voice_lang_session_expired(self) -> bool:
+        """True when the voice-language activity window has timed out."""
+        locked_at = self.session.get("voice_lang_locked_at")
+        if locked_at is None:
+            return True
+        try:
+            age_sec = time.time() - float(locked_at)
+        except (TypeError, ValueError):
+            return True
+        return age_sec >= max(1, VOICE_LANG_SESSION_MINUTES) * 60
+
+    def resolve_stt_language(self) -> LangCode | None:
+        """Always None — Whisper must auto-detect for maximum quality.
+
+        Reply language is chosen *after* transcription from the transcript
+        script (see apply_voice_language). Pinning STT language caused
+        hallucinations on Egyptian dialect.
+        """
+        return None
+
+    def apply_voice_language(self, transcript: str) -> LangCode:
+        """Set reply language from what the user actually said (post-STT).
+
+        Quality rule: Whisper stays auto-detect. We only read the transcript:
+        - Confident English speech → English replies
+        - Confident Arabic speech → Arabic replies
+        - Garbage / unclear → keep previous reply language
+        """
+        if is_whisper_garbage(transcript):
+            return self.language
+
+        detected = detect_language(transcript, fallback=None)
+        if detected not in ("ar", "en"):
+            return self.language
+
+        if not is_confident_switch(transcript, detected):
+            return self.language
+
+        # Clear speech in the other language → switch replies immediately.
+        if detected != self.language or not self.session.get("voice_lang_locked"):
+            return self.set_language(detected)
+
+        self.session["voice_lang_locked_at"] = time.time()
+        return self.language
 
     def _keep(self, previous: LangCode | None) -> LangCode:
         code = previous or "ar"
@@ -108,6 +161,10 @@ class LanguageService:
 
         detected = detect_language(sample, fallback=None)
         if detected is None:
+            return self._keep(previous)
+
+        # Same language — keep flags (esp. post-menu allow_voice_lang_switch).
+        if previous is not None and detected == previous:
             return self._keep(previous)
 
         # Already have a language → only flip on confident real prose.
