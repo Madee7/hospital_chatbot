@@ -3,29 +3,24 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.core.config import BOOKING_WINDOW_DAYS, DEFAULT_CLINIC_ID, DEFAULT_TENANT_ID
+from app.core.config import BOOKING_WINDOW_DAYS, DEFAULT_CLINIC_ID
 from app.db.database import get_db
+from app.schemas.booking import (
+    ConfirmBookingRequest,
+    ConfirmBookingResponse,
+    DepartmentResponse,
+    DoctorCardResponse,
+    DoctorSlotsResponse,
+)
 from app.services import booking_service, doctor_service
 from app.services.booking_service import BookingError
 
 router = APIRouter(prefix="/booking", tags=["booking"])
 
 
-class ConfirmBookingRequest(BaseModel):
-    whatsapp_phone: str = Field(..., examples=["201000000001"])
-    patient_name: str | None = None
-    doctor_id: int
-    slot_id: int
-    reason: str | None = None
-    dob: str | None = None
-    clinic_id: int = DEFAULT_CLINIC_ID
-    tenant_id: int = DEFAULT_TENANT_ID
-
-
-@router.get("/departments")
+@router.get("/departments", response_model=list[DepartmentResponse])
 def api_list_departments(
     clinic_id: int = DEFAULT_CLINIC_ID,
     db: Session = Depends(get_db),
@@ -42,7 +37,7 @@ def api_list_departments(
     ]
 
 
-@router.get("/doctors")
+@router.get("/doctors", response_model=list[DoctorCardResponse])
 def api_list_doctors(
     department: str | None = None,
     department_id: int | None = None,
@@ -71,7 +66,7 @@ def api_list_doctors(
     return [doctor_service.doctor_card_payload(d) for d in doctors]
 
 
-@router.get("/doctors/{doctor_id}/slots")
+@router.get("/doctors/{doctor_id}/slots", response_model=DoctorSlotsResponse)
 def api_doctor_slots(
     doctor_id: int,
     clinic_id: int = DEFAULT_CLINIC_ID,
@@ -89,7 +84,7 @@ def api_doctor_slots(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.post("/confirm")
+@router.post("/confirm", response_model=ConfirmBookingResponse)
 def api_confirm_booking(
     body: ConfirmBookingRequest,
     db: Session = Depends(get_db),
