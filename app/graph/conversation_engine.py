@@ -993,6 +993,194 @@ def _reshow_booking_dates(phone: str, db: Session, conversation) -> bool:
     return True
 
 
+def _reshow_booking_slots(phone: str, db: Session, conversation) -> bool:
+    """Re-open the time list for the currently selected doctor/day."""
+    sess = _sess(phone)
+    lang = _lang(conversation, sess)
+    doctor_id = sess.get("doctor_id")
+    selected_date = sess.get("selected_date")
+    if not doctor_id or not selected_date:
+        return False
+    booking_service.release_expired_holds(db, clinic_id=DEFAULT_CLINIC_ID)
+    avail = booking_service.get_available_dates_and_slots(
+        db, doctor_id=int(doctor_id), clinic_id=DEFAULT_CLINIC_ID
+    )
+    day_slots = _filter_bookable_slots(
+        avail.get("dates", {}).get(str(selected_date)) or []
+    )
+    if not day_slots:
+        wa.send_text(phone, i18n.no_slots_on_day(lang))
+        return False
+    set_conversation_state(
+        db, conversation, ConversationState.BOOKING_SLOT, current_intent="booking_slot"
+    )
+    date_label = _date_option_title(str(selected_date), lang)
+    _offer_list(
+        phone,
+        body=i18n.choose_slot_on_date(lang, date_label),
+        button_label=i18n.times_button_label(lang),
+        rows=_slot_rows_with_change_day(day_slots, lang),
+        section_title=i18n.slots_section_title(lang),
+    )
+    sess["awaiting"] = "slot"
+    db.commit()
+    return True
+
+
+def _is_explicit_back_choice(choice: str, text: str) -> bool:
+    """True only for real back/return wording, not generic 'no/cancel'."""
+    back_tokens = {
+        "رجوع",
+        "ارجع",
+        "إرجع",
+        "عودة",
+        "العودة",
+        "Back",
+        "back",
+        "go back",
+    }
+    return choice.strip() in back_tokens or text.strip() in back_tokens
+
+
+def _handle_explicit_back(
+    phone: str,
+    db: Session,
+    conversation: Conversation,
+    *,
+    conv_state: str,
+    choice: str,
+    text: str,
+) -> bool:
+    """Handle a text 'back' request by returning one sensible step."""
+    if not _is_explicit_back_choice(choice, text):
+        return False
+
+    sess = _sess(phone)
+    lang = _lang(conversation, sess)
+    awaiting = sess.get("awaiting")
+
+    if conv_state == ConversationState.BOOKING_DOCTOR.value:
+        if awaiting == "doctor":
+            if sess.get("doctor_pick_mode") == "by_specialty":
+                departments = doctor_service.list_departments(db, DEFAULT_CLINIC_ID)
+                if departments:
+                    _offer_list(
+                        phone,
+                        body=i18n.choose_specialty(lang),
+                        button_label=i18n.specialties_label(lang),
+                        rows=[
+                            {
+                                "id": f"dept_{d.department_id}",
+                                "title": (
+                                    i18n.pick_bilingual_field(
+                                        en=d.name_en,
+                                        ar=d.name_ar,
+                                        lang=lang,
+                                        allow_cross_script=False,
+                                        fallback=str(d.department_id),
+                                    )
+                                    or str(d.department_id)
+                                )[:24],
+                            }
+                            for d in departments
+                        ],
+                        section_title=i18n.specialties_label(lang),
+                    )
+                    sess["awaiting"] = "department"
+                    sess.pop("doctor_id", None)
+                    db.commit()
+                    return True
+            sess.pop("department_id", None)
+            sess.pop("doctor_pick_mode", None)
+            _offer_buttons(phone, i18n.booking_path_prompt(lang), i18n.booking_path_buttons(lang))
+            sess["awaiting"] = None
+            db.commit()
+            return True
+
+        if awaiting == "department":
+            sess.pop("department_id", None)
+            _offer_buttons(phone, i18n.booking_path_prompt(lang), i18n.booking_path_buttons(lang))
+            sess["awaiting"] = None
+            db.commit()
+            return True
+
+        _clear_draft(phone)
+        _send_main_menu(phone, db, conversation)
+        return True
+
+    if conv_state == ConversationState.BOOKING_DATE.value:
+        sess.pop("doctor_id", None)
+        if sess.get("department_id"):
+            ok = _show_doctor_cards(phone, db, sess.get("department_id"))
+            if ok:
+                sess["awaiting"] = "doctor"
+                sess["doctor_pick_mode"] = "by_specialty"
+                db.commit()
+                return True
+        ok = _offer_doctors_by_name_list(phone, db, conversation)
+        if ok:
+            sess["awaiting"] = "doctor"
+            sess["doctor_pick_mode"] = "by_name"
+            sess["department_id"] = None
+            db.commit()
+            return True
+        _offer_buttons(phone, i18n.booking_path_prompt(lang), i18n.booking_path_buttons(lang))
+        db.commit()
+        return True
+
+    if conv_state == ConversationState.BOOKING_SLOT.value:
+        return _reshow_booking_dates(phone, db, conversation)
+
+    if conv_state == ConversationState.PATIENT_DETAILS.value:
+        return _reshow_booking_slots(phone, db, conversation)
+
+    if conv_state == ConversationState.CONFIRMING.value:
+        return _reshow_booking_slots(phone, db, conversation)
+
+    if conv_state == ConversationState.RESCHEDULE.value:
+        if awaiting == "pick_appointment":
+            _clear_draft(phone)
+            _send_main_menu(phone, db, conversation)
+            return True
+        if awaiting == "change_type":
+            _start_reschedule_flow(phone, db, conversation)
+            return True
+        if awaiting == "date":
+            _offer_reschedule_change_type(phone, sess, lang=lang)
+            sess["awaiting"] = "change_type"
+            db.commit()
+            return True
+        if awaiting == "slot":
+            if sess.get("flow") == "reschedule_time":
+                _offer_reschedule_change_type(phone, sess, lang=lang)
+                sess["awaiting"] = "change_type"
+                db.commit()
+                return True
+            if _offer_reschedule_day_picker(phone, db, sess, lang):
+                db.commit()
+                return True
+        if awaiting == "confirm":
+            if sess.get("flow") == "reschedule_time":
+                _offer_reschedule_change_type(phone, sess, lang=lang)
+                sess["awaiting"] = "change_type"
+                db.commit()
+                return True
+            if _offer_reschedule_day_picker(phone, db, sess, lang):
+                db.commit()
+                return True
+
+    if conv_state == ConversationState.CANCEL.value:
+        if awaiting == "pick_appointment":
+            _clear_draft(phone)
+            _send_main_menu(phone, db, conversation)
+            return True
+        if awaiting == "confirm":
+            _start_cancel_flow(phone, db, conversation)
+            return True
+
+    return False
+
+
 def node_persist_inbound(state: GraphState) -> GraphState:
     db: Session = state["db_session"]
     phone = state["phone"]
@@ -1118,6 +1306,16 @@ def node_handle(state: GraphState) -> GraphState:
     if explicit_menu:
         _clear_draft(phone)
         _send_main_menu(phone, db, conversation)
+        return {**state, "handled": True}
+
+    if _handle_explicit_back(
+        phone,
+        db,
+        conversation,
+        conv_state=conv_state,
+        choice=choice,
+        text=text,
+    ):
         return {**state, "handled": True}
 
     # UC-002 rebook CTA after cancel (state may already be MAIN_MENU)
