@@ -962,6 +962,14 @@ def page_settings(db, clinic_id: int) -> None:
 def page_usage(db, clinic_id: int) -> None:
     st.subheader(_ui("usage"))
     days = st.slider("Period (days)", 7, 90, 30, key="usage_days")
+    wa_stats = admin.whatsapp_message_stats(db, clinic_id, days=days)
+    failed = admin.usage_failure_count(db, clinic_id, days=days)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("WhatsApp inbound", wa_stats["inbound"])
+    c2.metric("WhatsApp outbound", wa_stats["outbound"])
+    c3.metric("WhatsApp total", wa_stats["total"])
+    c4.metric("Failed API calls", failed)
+
     summary = admin.usage_summary(db, clinic_id, days=days)
     st.markdown("**By provider / operation**")
     st.dataframe(_df(summary), use_container_width=True, hide_index=True)

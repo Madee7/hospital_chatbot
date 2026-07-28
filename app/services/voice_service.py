@@ -819,15 +819,19 @@ def route_whatsapp_voice_message(
     audio_seconds: float | None = None
     usage: dict[str, int] = {"prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0}
     plan: VoicePlan | None = None
+    stt_latency_ms: int | None = None
+    chat_latency_ms: int | None = None
     try:
         ogg_bytes = _download_whatsapp_audio(media_id)
         audio_seconds = voice_cost.estimate_audio_seconds(ogg_bytes)
+        t0 = time.perf_counter()
         transcript = _transcribe_ogg(
             ogg_bytes,
             db=db,
             clinic_id=cid,
             force_language=force_stt_language,
         )
+        stt_latency_ms = int(round((time.perf_counter() - t0) * 1000))
         # Drop Whisper outros / fake greetings before the planner sees them.
         from app.language.language_detector import (
             is_whisper_garbage,
@@ -861,16 +865,20 @@ def route_whatsapp_voice_message(
                 language="unknown",
             )
         elif VOICE_ROUTER_V2:
+            t1 = time.perf_counter()
             plan, usage = _plan_via_gpt_text(
                 transcript, options, current_step=current_step
             )
+            chat_latency_ms = int(round((time.perf_counter() - t1) * 1000))
             # Project onto V1 so the legacy fastpath stays available as a
             # fallback when the executor declines a step.
             understanding = _sanitize(plan.to_understanding(), options)
         else:
+            t1 = time.perf_counter()
             understanding, usage = _understand_via_gpt_text(
                 transcript, options, current_step=current_step
             )
+            chat_latency_ms = int(round((time.perf_counter() - t1) * 1000))
     except VoiceProcessingError:
         logger.exception("[voice] processing failed media_id=%s", media_id)
         result = _clarify_dict(
@@ -883,6 +891,8 @@ def route_whatsapp_voice_message(
             stt_model=OPENAI_STT_MODEL,
             audio_seconds=audio_seconds,
             chat_model=chat_model,
+            stt_latency_ms=stt_latency_ms,
+            chat_latency_ms=chat_latency_ms,
             **usage,
         )
         logger.info("[voice][cost] %s", voice_cost.format_cost_log(result["cost"]))
@@ -892,6 +902,8 @@ def route_whatsapp_voice_message(
         stt_model=OPENAI_STT_MODEL,
         audio_seconds=audio_seconds,
         chat_model=chat_model,
+        stt_latency_ms=stt_latency_ms,
+        chat_latency_ms=chat_latency_ms,
         **usage,
     )
 

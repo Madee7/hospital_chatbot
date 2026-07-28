@@ -971,6 +971,41 @@ def usage_summary(db: Session, clinic_id: int, days: int = 30) -> list[dict]:
     ]
 
 
+def whatsapp_message_stats(db: Session, clinic_id: int, days: int = 30) -> dict[str, Any]:
+    """Inbound/outbound WhatsApp message counts for the Usage page (BRD Usage/costs)."""
+    since = datetime.utcnow() - timedelta(days=days)
+    rows = (
+        db.query(Message.direction, func.count(Message.message_id))
+        .join(Conversation, Conversation.conversation_id == Message.conversation_id)
+        .filter(Conversation.clinic_id == clinic_id, Message.created_at >= since)
+        .group_by(Message.direction)
+        .all()
+    )
+    by_dir = {(d or "").lower(): int(c or 0) for d, c in rows}
+    inbound = by_dir.get("inbound", 0)
+    outbound = by_dir.get("outbound", 0)
+    return {
+        "inbound": inbound,
+        "outbound": outbound,
+        "total": inbound + outbound,
+        "period_days": days,
+    }
+
+
+def usage_failure_count(db: Session, clinic_id: int, days: int = 30) -> int:
+    since = datetime.utcnow() - timedelta(days=days)
+    return int(
+        db.query(func.count(UsageLog.usage_id))
+        .filter(
+            UsageLog.clinic_id == clinic_id,
+            UsageLog.created_at >= since,
+            UsageLog.status == "failed",
+        )
+        .scalar()
+        or 0
+    )
+
+
 def dashboard_reschedule(
     db: Session,
     *,

@@ -261,6 +261,11 @@ def _handle_voice(phone: str, media_id: str | None) -> None:
             tenant_id=DEFAULT_TENANT_ID,
             clinic_id=DEFAULT_CLINIC_ID,
             cost=cost,
+            status=(
+                "failed"
+                if (result.get("stt_provider") or "") == "failed"
+                else "completed"
+            ),
         )
 
         # Reply language follows clear speech in the transcript (EN↔AR).

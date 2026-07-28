@@ -1,0 +1,27 @@
+name: Deploy to Windows server
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@master
+        with:
+          host: 196.219.86.38
+          username: Administrator
+          key: ${{ secrets.WINDOWS_SSH_KEY }}
+          port: 22
+          script: |
+            cd C:\apps\hospital-chatbot
+            git pull
+            .\venv\Scripts\pip.exe install -r requirements.txt
+            .\venv\Scripts\python.exe -m alembic upgrade head
+            Restart-Service HospitalChatbotBackend

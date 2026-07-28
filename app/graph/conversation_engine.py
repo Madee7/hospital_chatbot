@@ -247,9 +247,25 @@ def _lang(conversation: Conversation, session: dict[str, Any] | None = None) -> 
     return get_conversation_language(conversation, session)
 
 
-def _send_text(phone: str, text: str, lang: str | None = None) -> None:
+def _send_text(
+    phone: str,
+    text: str,
+    lang: str | None = None,
+    *,
+    db: Session | None = None,
+) -> None:
     """Send WhatsApp text after optional language validation (LLM-safe)."""
-    body = ensure_response_language(text, lang) if lang else text
+    body = (
+        ensure_response_language(
+            text,
+            lang,
+            db=db,
+            tenant_id=DEFAULT_TENANT_ID,
+            clinic_id=DEFAULT_CLINIC_ID,
+        )
+        if lang
+        else text
+    )
     wa.send_text(phone, body)
 
 
@@ -325,6 +341,7 @@ def _resolve_free_text_choice(
     payload_id: str,
     *,
     lang: str | None = None,
+    db: Session | None = None,
 ) -> str:
     """
     If user typed instead of tapping a list/button, map text → option id.
@@ -352,7 +369,14 @@ def _resolve_free_text_choice(
         return text
     if not options:
         return text
-    resolved = resolve_choice(text, options, lang=lang)
+    resolved = resolve_choice(
+        text,
+        options,
+        lang=lang,
+        db=db,
+        tenant_id=DEFAULT_TENANT_ID,
+        clinic_id=DEFAULT_CLINIC_ID,
+    )
     if resolved:
         try:
             print(f"[choice] mapped {text!r} -> {resolved!r}")
@@ -516,7 +540,8 @@ def _choice(state: GraphState, *, lang: str | None = None) -> str:
     payload = (state.get("payload_id") or "").strip()
     text = (state.get("text") or "").strip()
     phone = state.get("phone") or ""
-    return _resolve_free_text_choice(phone, text, payload, lang=lang)
+    db = state.get("db_session")
+    return _resolve_free_text_choice(phone, text, payload, lang=lang, db=db)
 
 
 def _offer_doctors_by_name_list(phone: str, db: Session, conversation: Conversation) -> bool:
@@ -1024,7 +1049,13 @@ def node_handle(state: GraphState) -> GraphState:
     db.commit()
 
     choice = _choice(state, lang=lang)
-    intent = detect_intent(text or choice, lang=lang)
+    intent = detect_intent(
+        text or choice,
+        lang=lang,
+        db=db,
+        tenant_id=DEFAULT_TENANT_ID,
+        clinic_id=DEFAULT_CLINIC_ID,
+    )
     state = {**state, "language": lang}
 
     # ---- BR-015: high-risk medical language → urgent handover (no advice) ----
