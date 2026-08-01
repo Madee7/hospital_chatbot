@@ -22,7 +22,8 @@ Thumbs.db
 cloudflared.exe
 ngrok.exe
 
-# Images
+# Images (keep documentation diagrams)
 *.jpg
 *.jpeg
 *.png
+!docs/images/
