@@ -32,7 +32,7 @@ def resolve_choice_rules(user_text: str, options: list[Option]) -> str | None:
     if not text or not options:
         return None
 
-    # Pure number → 1-based index
+    # Pure number → 1-based index (only when the whole message is a number)
     if re.fullmatch(r"\d{1,2}", text):
         idx = int(text) - 1
         if 0 <= idx < len(options):
@@ -47,13 +47,24 @@ def resolve_choice_rules(user_text: str, options: list[Option]) -> str | None:
             return str(options[idx]["id"])
 
     n = _norm(text)
+    time_like = any(_is_time_like_title(str(o.get("title") or "")) for o in options)
+    date_like = any(
+        str(o.get("id") or "").startswith("date_")
+        or _is_date_like_title(str(o.get("title") or ""))
+        for o in options
+    )
+    # Slot/day lists: exact id/title only — no substring / fuzzy contains.
+    strict = time_like or date_like
+
     for opt in options:
         oid = str(opt.get("id") or "")
         title = str(opt.get("title") or "")
         desc = str(opt.get("description") or "")
         if n == _norm(oid) or n == _norm(title):
             return oid
-        # "اختيار د. فلان" style
+        if strict:
+            continue
+        # "اختيار د. فلان" style (non-time lists only)
         if title and _norm(title) in n:
             return oid
         if n and n in _norm(title):
@@ -61,6 +72,81 @@ def resolve_choice_rules(user_text: str, options: list[Option]) -> str | None:
         if desc and (n in _norm(desc) or _norm(desc) in n):
             return oid
     return None
+
+
+def _is_time_like_title(title: str) -> bool:
+    t = title or ""
+    if re.search(r"\d{1,2}\s*:\s*\d{2}", t):
+        return True
+    return bool(re.search(r"\b(am|pm)\b", t, flags=re.IGNORECASE)) or (
+        ("ص" in t or "م" in t) and ":" in t
+    )
+
+
+def _is_date_like_title(title: str) -> bool:
+    t = title or ""
+    return bool(re.search(r"\d{1,2}-\d{1,2}-\d{4}", t) or re.search(r"\d{4}-\d{2}-\d{2}", t))
+
+
+def _extract_clock_hours(text: str) -> set[int]:
+    """Hours the user mentioned as clock time (not bare list-index messages)."""
+    raw = (text or "").strip()
+    if not raw:
+        return set()
+    # Bare "3" / "٧" is list index, not a clock claim for this check.
+    arab_map = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+    digit_only = raw.translate(arab_map)
+    if re.fullmatch(r"\d{1,2}", digit_only):
+        return set()
+
+    t = raw.translate(arab_map)
+    hours: set[int] = set()
+    for m in re.finditer(r"(\d{1,2})\s*:\s*\d{2}", t):
+        h = int(m.group(1))
+        if 1 <= h <= 12 or 0 <= h <= 23:
+            hours.add(h % 12 or 12)
+            hours.add(h)
+    # «الساعة 7» / «الساعه 1» / «7 متاح» / «at 7»
+    for m in re.finditer(
+        r"(?:الساع[ةه]|الساعه|ساعة|الساعه|at\s+)?\b(\d{1,2})\b",
+        t,
+        flags=re.IGNORECASE,
+    ):
+        h = int(m.group(1))
+        if 1 <= h <= 12:
+            hours.add(h)
+        elif 0 <= h <= 23:
+            hours.add(h)
+            hours.add(h % 12 or 12)
+    return hours
+
+
+def _option_clock_hours(title: str) -> set[int]:
+    hours: set[int] = set()
+    for m in re.finditer(r"(\d{1,2})\s*:\s*\d{2}", title or ""):
+        h = int(m.group(1))
+        hours.add(h)
+        if 0 <= h <= 23:
+            hours.add(h % 12 or 12)
+    return hours
+
+
+def _llm_pick_consistent(user_text: str, options: list[Option], option_id: str) -> bool:
+    """Reject LLM picks that ignore a clearly spoken clock hour not in that option."""
+    spoken = _extract_clock_hours(user_text)
+    if not spoken:
+        return True
+    opt = next((o for o in options if str(o.get("id")) == option_id), None)
+    if not opt:
+        return False
+    title = str(opt.get("title") or "")
+    if not _is_time_like_title(title):
+        return True
+    opt_hours = _option_clock_hours(title)
+    if not opt_hours:
+        return True
+    # Require overlap between spoken hour and the option's displayed hours.
+    return bool(spoken & opt_hours)
 
 
 def resolve_choice_llm(
@@ -101,7 +187,14 @@ def resolve_choice_llm(
                 {
                     "role": "user",
                     "content": json.dumps(
-                        {"user_text": user_text, "options": catalog},
+                        {
+                            "user_text": user_text,
+                            "options": catalog,
+                            "reminder": (
+                                "Return null if the user asks about a time/day that is "
+                                "not in options. Never substitute a different slot."
+                            ),
+                        },
                         ensure_ascii=False,
                     ),
                 },
@@ -125,7 +218,15 @@ def resolve_choice_llm(
             return None
         option_id = str(option_id).strip()
         allowed = {str(o.get("id")) for o in options}
-        return option_id if option_id in allowed else None
+        if option_id not in allowed:
+            return None
+        if not _llm_pick_consistent(user_text, options, option_id):
+            print(
+                f"[choice_resolver] rejected inconsistent LLM pick "
+                f"{option_id!r} for {user_text!r}"
+            )
+            return None
+        return option_id
     except Exception as exc:
         print(f"[choice_resolver] LLM failed: {exc}")
         log_openai_chat_usage(
@@ -148,14 +249,17 @@ def resolve_choice(
     db: Session | None = None,
     tenant_id: int | None = None,
     clinic_id: int | None = None,
+    allow_llm: bool = True,
 ) -> str | None:
-    """Rules first, then LLM. Returns option id or None."""
+    """Rules first, then LLM (optional). Returns option id or None."""
     options = options or []
     if not options:
         return None
     hit = resolve_choice_rules(user_text, options)
     if hit:
         return hit
+    if not allow_llm:
+        return None
     return resolve_choice_llm(
         user_text,
         options,

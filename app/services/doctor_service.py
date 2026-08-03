@@ -290,8 +290,13 @@ def list_doctors_by_department(
     )
 
 
-def list_active_doctors(db: Session, clinic_id: int, limit: int = 20) -> list[Doctor]:
-    return (
+def list_active_doctors(
+    db: Session,
+    clinic_id: int,
+    limit: int = 20,
+    offset: int = 0,
+) -> list[Doctor]:
+    query = (
         db.query(Doctor)
         .options(joinedload(Doctor.department))
         .filter(
@@ -299,9 +304,10 @@ def list_active_doctors(db: Session, clinic_id: int, limit: int = 20) -> list[Do
             Doctor.active_flag.is_(True),
         )
         .order_by(Doctor.name_en.asc(), Doctor.name_ar.asc())
-        .limit(limit)
-        .all()
     )
+    if offset:
+        query = query.offset(offset)
+    return query.limit(limit).all()
 
 
 def get_doctor(db: Session, doctor_id: int, clinic_id: int | None = None) -> Doctor | None:

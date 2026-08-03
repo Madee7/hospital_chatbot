@@ -37,6 +37,27 @@ _COMMAND_KEEP_LANG = {
 _EXPLICIT_AR = {"العربية", "عربي", "arabic", "lang_ar"}
 _EXPLICIT_EN = {"english", "الانجليزية", "الإنجليزية", "lang_en"}
 
+# Short greetings that should set / flip language (bypasses min-word-length rules).
+_GREETING_AR = {
+    "مرحبا",
+    "مرحباً",
+    "اهلا",
+    "أهلا",
+    "اهلاً",
+    "أهلاً",
+    "السلام عليكم",
+    "سلام",
+}
+_GREETING_EN = {
+    "hi",
+    "hello",
+    "hey",
+    "good morning",
+    "good afternoon",
+    "good evening",
+    "good night",
+}
+
 # Short UI echoes that can appear without a structured payload.
 # Long menu phrases are NOT listed — typed "تعديل موعد" should still count as Arabic.
 _UI_TITLE_KEEP_LANG = {
@@ -267,9 +288,14 @@ def is_confident_switch(text: str, detected: LangCode) -> bool:
     raw = (text or "").strip()
     if not raw or is_non_linguistic(raw) or is_whisper_garbage(raw):
         return False
+    lower = raw.lower()
     if detected == "ar":
+        if raw in _GREETING_AR or lower in {g.lower() for g in _GREETING_AR}:
+            return True
         return _has_real_arabic_words(raw)
     if detected == "en":
+        if lower in _GREETING_EN:
+            return True
         return _has_real_english_words(raw) and len(_latin_letters_excluding_ampm(raw)) >= 4
     return False
 
@@ -291,6 +317,10 @@ def detect_language(
     if raw in _EXPLICIT_AR or lower in _EXPLICIT_AR:
         return "ar"
     if raw in _EXPLICIT_EN or lower in _EXPLICIT_EN:
+        return "en"
+    if raw in _GREETING_AR or lower in {g.lower() for g in _GREETING_AR}:
+        return "ar"
+    if lower in _GREETING_EN:
         return "en"
 
     if is_non_linguistic(raw):

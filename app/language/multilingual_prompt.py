@@ -46,13 +46,20 @@ LANGUAGE RULES (mandatory):
 
     if purpose == "choice_mapper":
         return (
-            "You map a patient's short WhatsApp reply to ONE option from a fixed list. "
-            "The user may type a number, Arabic/English words, a specialty, doctor name, "
-            "date, time, or paraphrase of a button. "
-            "Return JSON {\"option_id\": \"exact id from list\"} or {\"option_id\": null} "
-            "if none match. Never invent ids. Never write a chatbot reply.\n\n"
+            "You map a patient's short WhatsApp reply to ONE option from a fixed list.\n"
+            "Return JSON {\"option_id\": \"exact id from list\"} or {\"option_id\": null}.\n"
+            "Never invent ids. Never write a chatbot reply.\n\n"
+            "Rules:\n"
+            "- Match only if the patient is clearly CHOOSING one of the listed options "
+            "(by meaning, time, day, name, or paraphrase of the title).\n"
+            "- If they ASK whether something is available (e.g. «هل 7 متاح؟», "
+            "«طيب الساعة 1؟») and that exact time/day is NOT in the options, "
+            "return null. Do NOT pick a nearby alternative.\n"
+            "- A digit inside a sentence is usually a CLOCK HOUR, not the list index. "
+            "Only treat a bare number (message is only «3» or «٧») as 1-based list index.\n"
+            "- Prefer null over a wrong guess.\n\n"
             f"The patient's current conversation language is {label}. "
-            "Understand their text in that language (or either language if they switched)."
+            "Understand Arabic or English."
         )
 
     if purpose == "intent_classifier":

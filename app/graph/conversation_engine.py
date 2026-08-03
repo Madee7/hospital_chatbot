@@ -376,6 +376,7 @@ def _resolve_free_text_choice(
         db=db,
         tenant_id=DEFAULT_TENANT_ID,
         clinic_id=DEFAULT_CLINIC_ID,
+        allow_llm=True,
     )
     if resolved:
         try:
@@ -492,7 +493,7 @@ def _slot_option_row(slot: dict, lang: str | None = "ar") -> dict[str, str]:
 
 
 def _slot_list_rows(slots: list[dict], lang: str | None = "ar") -> list[dict[str, str]]:
-    return [_slot_option_row(s, lang) for s in slots[:10]]
+    return [_slot_option_row(s, lang) for s in slots]
 
 
 def _filter_bookable_slots(slots: list[dict]) -> list[dict]:
@@ -531,7 +532,7 @@ def _date_list_rows(dates: list[str], lang: str | None = "ar") -> list[dict[str,
             "title": _date_option_title(d, lang),
             "description": "",
         }
-        for d in dates[:10]
+        for d in dates
     ]
 
 
@@ -544,21 +545,160 @@ def _choice(state: GraphState, *, lang: str | None = None) -> str:
     return _resolve_free_text_choice(phone, text, payload, lang=lang, db=db)
 
 
-def _offer_doctors_by_name_list(phone: str, db: Session, conversation: Conversation) -> bool:
-    """List all active doctors (name + specialty) for the 'by doctor name' path."""
-    lang = _lang(conversation, _sess(phone))
-    doctors = doctor_service.list_active_doctors(db, DEFAULT_CLINIC_ID, limit=10)
+# WhatsApp interactive lists allow at most 10 rows.
+_WA_LIST_MAX_ROWS = 10
+
+
+def _page_items(
+    items: list[Any],
+    offset: int,
+    *,
+    capacity: int,
+) -> tuple[list[Any], bool, int]:
+    """Return (page_items, has_more, next_offset) for a WhatsApp list page."""
+    if offset < 0:
+        offset = 0
+    if capacity < 1:
+        capacity = 1
+    rest = items[offset:]
+    if len(rest) <= capacity:
+        page = list(rest)
+        return page, False, offset + len(page)
+    page = list(rest[: capacity - 1])
+    return page, True, offset + len(page)
+
+
+def _apply_list_page(
+    sess: dict[str, Any],
+    kind: str,
+    items: list[Any],
+    *,
+    reset: bool = False,
+    reserved_tail: int = 0,
+) -> tuple[list[Any], bool, int]:
+    """Track offset in session; return (page_items, has_more, page_number)."""
+    off_key = f"list_{kind}_offset"
+    next_key = f"list_{kind}_next_offset"
+    page_key = f"list_{kind}_page"
+    if reset:
+        sess[off_key] = 0
+        sess[page_key] = 1
+        sess.pop(next_key, None)
+    offset = int(sess.get(off_key) or 0)
+    page_num = max(1, int(sess.get(page_key) or 1))
+    capacity = _WA_LIST_MAX_ROWS - max(0, reserved_tail)
+    page, has_more, next_off = _page_items(items, offset, capacity=capacity)
+    if not page and offset > 0 and items:
+        sess[off_key] = 0
+        sess[page_key] = 1
+        return _apply_list_page(
+            sess, kind, items, reset=True, reserved_tail=reserved_tail
+        )
+    sess["list_page_kind"] = kind
+    sess[page_key] = page_num
+    if has_more:
+        sess[next_key] = next_off
+    else:
+        sess.pop(next_key, None)
+    return page, has_more, page_num
+
+
+def _rows_with_more(
+    rows: list[dict[str, str]],
+    lang: str | None,
+    has_more: bool,
+    *,
+    more_description: str | None = None,
+) -> list[dict[str, str]]:
+    if not has_more:
+        return rows
+    return list(rows) + [i18n.list_more_row(lang, description=more_description)]
+
+
+def _department_list_rows(departments: list, lang: str | None) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for d in departments:
+        title = (
+            i18n.pick_bilingual_field(
+                en=d.name_en,
+                ar=d.name_ar,
+                lang=lang,
+                allow_cross_script=False,
+                fallback=str(d.department_id),
+            )
+            or str(d.department_id)
+        )[:24]
+        rows.append({"id": f"dept_{d.department_id}", "title": title, "description": ""})
+    return rows
+
+
+def _offer_departments_list(
+    phone: str,
+    db: Session,
+    conversation: Conversation,
+    *,
+    reset: bool = False,
+) -> bool:
+    sess = _sess(phone)
+    lang = _lang(conversation, sess)
+    departments = doctor_service.list_departments(db, DEFAULT_CLINIC_ID)
+    if not departments:
+        return False
+    page, has_more, page_num = _apply_list_page(
+        sess, "departments", departments, reset=reset
+    )
+    rows = _rows_with_more(
+        _department_list_rows(page, lang),
+        lang,
+        has_more,
+        more_description=(
+            "Next specialties" if i18n.is_english(lang) else "تخصصات الصفحة التالية"
+        ),
+    )
+    _offer_list(
+        phone,
+        body=i18n.paginated_list_body(
+            lang,
+            first_page=i18n.choose_specialty(lang),
+            topic=(
+                "More specialties" if i18n.is_english(lang) else "متابعة التخصصات"
+            ),
+            page=page_num,
+            has_more=has_more,
+            more_hint=i18n.specialties_list_more_hint(lang),
+        ),
+        button_label=i18n.specialties_label(lang),
+        rows=rows,
+        section_title=i18n.specialties_label(lang),
+    )
+    return True
+
+
+def _offer_doctors_by_name_list(
+    phone: str,
+    db: Session,
+    conversation: Conversation,
+    *,
+    reset: bool = False,
+) -> bool:
+    """Paginated doctor list (name + specialty). Last row is «More» when needed."""
+    sess = _sess(phone)
+    lang = _lang(conversation, sess)
+    doctors = doctor_service.list_active_doctors(db, DEFAULT_CLINIC_ID, limit=200)
     if not doctors:
         _offer_buttons(
             phone,
             i18n.no_doctors_available(lang),
             i18n.no_doctors_alt_buttons(lang),
         )
-        _sess(phone)["awaiting"] = "no_slots_alt"
+        sess["awaiting"] = "no_slots_alt"
         return False
 
-    rows = []
-    for doc in doctors:
+    page, has_more, page_num = _apply_list_page(
+        sess, "doctors_name", doctors, reset=reset
+    )
+    rows: list[dict[str, str]] = []
+    for doc in page:
         fields = i18n.doctor_display_fields(doc, lang)
         name = (fields.get("name") or f"Doctor {doc.doctor_id}")[:24]
         specialty = (fields.get("specialization") or "")[:72]
@@ -569,13 +709,239 @@ def _offer_doctors_by_name_list(phone: str, db: Session, conversation: Conversat
                 "description": specialty,
             }
         )
+    rows = _rows_with_more(
+        rows,
+        lang,
+        has_more,
+        more_description=(
+            "Next doctors" if i18n.is_english(lang) else "أطباء الصفحة التالية"
+        ),
+    )
     _offer_list(
         phone,
-        body=i18n.doctors_by_name_prompt(lang),
+        body=i18n.paginated_list_body(
+            lang,
+            first_page=i18n.doctors_by_name_prompt(lang),
+            topic=("More doctors" if i18n.is_english(lang) else "متابعة الأطباء"),
+            page=page_num,
+            has_more=has_more,
+            more_hint=i18n.doctors_list_more_hint(lang),
+        ),
         button_label=i18n.doctors_list_button_label(lang),
         rows=rows,
         section_title=i18n.doctors_list_button_label(lang),
     )
+    return True
+
+
+def _offer_slots_list(
+    phone: str,
+    day_slots: list[dict],
+    lang: str | None,
+    *,
+    body: str,
+    reset: bool = False,
+    with_change_day: bool = False,
+) -> None:
+    sess = _sess(phone)
+    sess["list_slots_cache"] = list(day_slots)
+    sess["list_slots_with_change_day"] = bool(with_change_day)
+    sess["list_slots_body"] = body
+    reserved = 1 if with_change_day else 0
+    page, has_more, page_num = _apply_list_page(
+        sess, "slots", day_slots, reset=reset, reserved_tail=reserved
+    )
+    rows = [_slot_option_row(s, lang) for s in page]
+    rows = _rows_with_more(
+        rows,
+        lang,
+        has_more,
+        more_description=(
+            "Next times" if i18n.is_english(lang) else "مواعيد الصفحة التالية"
+        ),
+    )
+    if with_change_day:
+        rows.append(
+            {
+                "id": "change_day",
+                "title": i18n.change_day_row_title(lang),
+                "description": "",
+            }
+        )
+    _offer_list(
+        phone,
+        body=i18n.paginated_list_body(
+            lang,
+            first_page=body,
+            topic=("More times" if i18n.is_english(lang) else "متابعة المواعيد"),
+            page=page_num,
+            has_more=has_more,
+            more_hint=i18n.times_list_more_hint(lang),
+        ),
+        button_label=i18n.times_button_label(lang),
+        rows=rows,
+        section_title=i18n.slots_section_title(lang),
+    )
+
+
+def _offer_dates_list(
+    phone: str,
+    dates: list[str],
+    lang: str | None,
+    *,
+    body: str,
+    reset: bool = False,
+) -> None:
+    sess = _sess(phone)
+    sess["list_dates_cache"] = list(dates)
+    sess["list_dates_body"] = body
+    page, has_more, page_num = _apply_list_page(sess, "dates", dates, reset=reset)
+    rows = _rows_with_more(
+        _date_list_rows(page, lang),
+        lang,
+        has_more,
+        more_description=(
+            "Next days" if i18n.is_english(lang) else "أيام الصفحة التالية"
+        ),
+    )
+    _offer_list(
+        phone,
+        body=i18n.paginated_list_body(
+            lang,
+            first_page=body,
+            topic=("More days" if i18n.is_english(lang) else "متابعة الأيام"),
+            page=page_num,
+            has_more=has_more,
+            more_hint=i18n.days_list_more_hint(lang),
+        ),
+        button_label=i18n.days_button_label(lang),
+        rows=rows,
+        section_title=i18n.dates_section_title(lang),
+    )
+
+
+def _offer_upcoming_appointments_list(
+    phone: str,
+    db: Session,
+    conversation: Conversation,
+    *,
+    purpose: str,
+    reset: bool = False,
+) -> bool:
+    """purpose: 'reschedule' | 'cancel'."""
+    sess = _sess(phone)
+    lang = _lang(conversation, sess)
+    upcoming = booking_service.list_upcoming_appointments_for_phone(
+        db, clinic_id=DEFAULT_CLINIC_ID, whatsapp_phone=phone
+    )
+    if not upcoming:
+        return False
+    sess["upcoming"] = {
+        str(a["appointment_id"]): _appt_session_info(a, lang) for a in upcoming
+    }
+    page, has_more, page_num = _apply_list_page(
+        sess, "appointments", upcoming, reset=reset
+    )
+    rows = _rows_with_more(
+        [_appt_list_row(a, lang) for a in page],
+        lang,
+        has_more,
+        more_description=(
+            "Next appointments"
+            if i18n.is_english(lang)
+            else "مواعيد الصفحة التالية"
+        ),
+    )
+    if purpose == "cancel":
+        first = i18n.pick_appointment_to_cancel(lang)
+        topic = "More appointments" if i18n.is_english(lang) else "متابعة المواعيد"
+    else:
+        first = i18n.pick_appointment_to_reschedule(lang)
+        topic = "More appointments" if i18n.is_english(lang) else "متابعة المواعيد"
+    _offer_list(
+        phone,
+        body=i18n.paginated_list_body(
+            lang,
+            first_page=first,
+            topic=topic,
+            page=page_num,
+            has_more=has_more,
+            more_hint=i18n.appointments_list_more_hint(lang),
+        ),
+        button_label=i18n.your_appointments_label(lang),
+        rows=rows,
+        section_title=i18n.appointments_section(lang),
+    )
+    return True
+
+
+def _try_handle_list_more(
+    phone: str,
+    db: Session,
+    conversation: Conversation,
+    sess: dict[str, Any],
+    choice: str,
+    text: str,
+) -> bool:
+    """Advance a paginated WhatsApp list when the user picks «More»."""
+    if not i18n.is_list_more_choice(choice, text):
+        return False
+    kind = sess.get("list_page_kind")
+    if not kind:
+        return False
+    next_key = f"list_{kind}_next_offset"
+    nxt = sess.get(next_key)
+    if nxt is not None:
+        sess[f"list_{kind}_offset"] = int(nxt)
+        sess[f"list_{kind}_page"] = int(sess.get(f"list_{kind}_page") or 1) + 1
+
+    lang = _lang(conversation, sess)
+    if kind == "doctors_name":
+        _offer_doctors_by_name_list(phone, db, conversation, reset=False)
+    elif kind == "departments":
+        if not _offer_departments_list(phone, db, conversation, reset=False):
+            return False
+    elif kind == "appointments":
+        raw = conversation.state
+        state_val = raw.value if hasattr(raw, "value") else raw
+        purpose = "cancel" if state_val == ConversationState.CANCEL.value else "reschedule"
+        if not _offer_upcoming_appointments_list(
+            phone, db, conversation, purpose=purpose, reset=False
+        ):
+            return False
+    elif kind == "dates":
+        dates = list(sess.get("list_dates_cache") or [])
+        if not dates and sess.get("doctor_id"):
+            avail = booking_service.get_available_dates_and_slots(
+                db, doctor_id=int(sess["doctor_id"]), clinic_id=DEFAULT_CLINIC_ID
+            )
+            dates = list(avail.get("dates", {}).keys())
+        body = sess.get("list_dates_body") or i18n.choose_day(lang)
+        _offer_dates_list(phone, dates, lang, body=body, reset=False)
+    elif kind == "slots":
+        day_slots = list(sess.get("list_slots_cache") or [])
+        selected_date = sess.get("selected_date")
+        if (not day_slots) and sess.get("doctor_id") and selected_date:
+            avail = booking_service.get_available_dates_and_slots(
+                db, doctor_id=int(sess["doctor_id"]), clinic_id=DEFAULT_CLINIC_ID
+            )
+            day_slots = _filter_bookable_slots(
+                avail.get("dates", {}).get(str(selected_date)) or []
+            )
+        date_label = _date_option_title(str(selected_date or ""), lang)
+        with_change_day = bool(sess.get("list_slots_with_change_day"))
+        body = sess.get("list_slots_body") or i18n.choose_slot_on_date(lang, date_label)
+        _offer_slots_list(
+            phone,
+            day_slots,
+            lang,
+            body=body,
+            reset=False,
+            with_change_day=with_change_day,
+        )
+    else:
+        return False
+    db.commit()
     return True
 
 
@@ -764,17 +1130,12 @@ def _start_reschedule_flow(phone: str, db: Session, conversation: Conversation) 
     sess = _sess(phone)
     _sess_clear_keep_lang(sess)
     sess["awaiting"] = "pick_appointment"
-    sess["upcoming"] = {
-        str(a["appointment_id"]): _appt_session_info(a, lang)
-        for a in upcoming
-    }
-    _offer_list(
-        phone,
-        body=i18n.pick_appointment_to_reschedule(lang),
-        button_label=i18n.your_appointments_label(lang),
-        rows=[_appt_list_row(a, lang) for a in upcoming[:10]],
-        section_title=i18n.appointments_section(lang),
-    )
+    if not _offer_upcoming_appointments_list(
+        phone, db, conversation, purpose="reschedule", reset=True
+    ):
+        wa.send_text(phone, i18n.no_upcoming_to_reschedule(lang))
+        _finish_flow_quietly(phone, db, conversation)
+        return
     db.commit()
 
 
@@ -803,12 +1164,8 @@ def _offer_reschedule_day_picker(phone: str, db: Session, sess: dict, lang: str)
         wa.send_text(phone, i18n.no_alternative_slots(lang))
         return False
     sess["awaiting"] = "date"
-    _offer_list(
-        phone,
-        body=i18n.choose_new_day(lang),
-        button_label=i18n.days_button_label(lang),
-        rows=_date_list_rows(dates, lang),
-        section_title=i18n.dates_section_title(lang),
+    _offer_dates_list(
+        phone, dates, lang, body=i18n.choose_new_day(lang), reset=True
     )
     return True
 
@@ -831,12 +1188,13 @@ def _offer_reschedule_same_day_slots(
         return False
     sess["awaiting"] = "slot"
     date_label = _date_option_title(selected_date, lang)
-    _offer_list(
+    _offer_slots_list(
         phone,
+        day_slots,
+        lang,
         body=i18n.choose_same_day_time(lang, date_label),
-        button_label=i18n.times_button_label(lang),
-        rows=_slot_list_rows(day_slots, lang),
-        section_title=i18n.slots_section_title(lang),
+        reset=True,
+        with_change_day=False,
     )
     return True
 
@@ -857,17 +1215,12 @@ def _start_cancel_flow(phone: str, db: Session, conversation: Conversation) -> N
     sess = _sess(phone)
     _sess_clear_keep_lang(sess)
     sess["awaiting"] = "pick_appointment"
-    sess["upcoming"] = {
-        str(a["appointment_id"]): _appt_session_info(a, lang)
-        for a in upcoming
-    }
-    _offer_list(
-        phone,
-        body=i18n.pick_appointment_to_cancel(lang),
-        button_label=i18n.your_appointments_label(lang),
-        rows=[_appt_list_row(a, lang) for a in upcoming[:10]],
-        section_title=i18n.appointments_section(lang),
-    )
+    if not _offer_upcoming_appointments_list(
+        phone, db, conversation, purpose="cancel", reset=True
+    ):
+        wa.send_text(phone, i18n.no_upcoming_to_cancel(lang))
+        _finish_flow_quietly(phone, db, conversation)
+        return
     db.commit()
 
 
@@ -919,12 +1272,8 @@ def continue_after_doctor_selected(
             db, conversation, ConversationState.RESCHEDULE, current_intent="reschedule"
         )
         sess["awaiting"] = "date"
-        _offer_list(
-            phone,
-            body=i18n.choose_new_day(lang),
-            button_label=i18n.days_button_label(lang),
-            rows=_date_list_rows(dates, lang),
-            section_title=i18n.dates_section_title(lang),
+        _offer_dates_list(
+            phone, dates, lang, body=i18n.choose_new_day(lang), reset=True
         )
         db.commit()
         return
@@ -932,19 +1281,25 @@ def continue_after_doctor_selected(
     set_conversation_state(
         db, conversation, ConversationState.BOOKING_DATE, current_intent="booking_date"
     )
-    _offer_list(
-        phone,
-        body=i18n.choose_day(lang),
-        button_label=i18n.days_button_label(lang),
-        rows=_date_list_rows(dates, lang),
-        section_title=i18n.dates_section_title(lang),
-    )
+    _offer_dates_list(phone, dates, lang, body=i18n.choose_day(lang), reset=True)
     db.commit()
 
 
 def _slot_rows_with_change_day(day_slots: list[dict], lang: str | None) -> list[dict[str, str]]:
-    """Time-slot rows plus a trailing 'change the day' row (list capped at 10)."""
-    rows = _slot_list_rows(day_slots, lang)[:9]
+    """Build first-page slot rows with change-day (for callers that still need rows)."""
+    # Prefer _offer_slots_list; kept for voice paths that assemble rows themselves.
+    reserved = 1
+    capacity = _WA_LIST_MAX_ROWS - reserved
+    page, has_more, _next = _page_items(day_slots, 0, capacity=capacity)
+    rows = [_slot_option_row(s, lang) for s in page]
+    rows = _rows_with_more(
+        rows,
+        lang,
+        has_more,
+        more_description=(
+            "Show more times" if i18n.is_english(lang) else "عرض المزيد من المواعيد"
+        ),
+    )
     rows.append(
         {
             "id": "change_day",
@@ -982,13 +1337,7 @@ def _reshow_booking_dates(phone: str, db: Session, conversation) -> bool:
         db, conversation, ConversationState.BOOKING_DATE, current_intent="booking_date"
     )
     sess["awaiting"] = None
-    _offer_list(
-        phone,
-        body=i18n.choose_day(lang),
-        button_label=i18n.days_button_label(lang),
-        rows=_date_list_rows(dates, lang),
-        section_title=i18n.dates_section_title(lang),
-    )
+    _offer_dates_list(phone, dates, lang, body=i18n.choose_day(lang), reset=True)
     db.commit()
     return True
 
@@ -1015,12 +1364,13 @@ def _reshow_booking_slots(phone: str, db: Session, conversation) -> bool:
         db, conversation, ConversationState.BOOKING_SLOT, current_intent="booking_slot"
     )
     date_label = _date_option_title(str(selected_date), lang)
-    _offer_list(
+    _offer_slots_list(
         phone,
+        day_slots,
+        lang,
         body=i18n.choose_slot_on_date(lang, date_label),
-        button_label=i18n.times_button_label(lang),
-        rows=_slot_rows_with_change_day(day_slots, lang),
-        section_title=i18n.slots_section_title(lang),
+        reset=True,
+        with_change_day=True,
     )
     sess["awaiting"] = "slot"
     db.commit()
@@ -1038,6 +1388,8 @@ def _is_explicit_back_choice(choice: str, text: str) -> bool:
         "Back",
         "back",
         "go back",
+        "Return",
+        "return",
     }
     return choice.strip() in back_tokens or text.strip() in back_tokens
 
@@ -1062,30 +1414,7 @@ def _handle_explicit_back(
     if conv_state == ConversationState.BOOKING_DOCTOR.value:
         if awaiting == "doctor":
             if sess.get("doctor_pick_mode") == "by_specialty":
-                departments = doctor_service.list_departments(db, DEFAULT_CLINIC_ID)
-                if departments:
-                    _offer_list(
-                        phone,
-                        body=i18n.choose_specialty(lang),
-                        button_label=i18n.specialties_label(lang),
-                        rows=[
-                            {
-                                "id": f"dept_{d.department_id}",
-                                "title": (
-                                    i18n.pick_bilingual_field(
-                                        en=d.name_en,
-                                        ar=d.name_ar,
-                                        lang=lang,
-                                        allow_cross_script=False,
-                                        fallback=str(d.department_id),
-                                    )
-                                    or str(d.department_id)
-                                )[:24],
-                            }
-                            for d in departments
-                        ],
-                        section_title=i18n.specialties_label(lang),
-                    )
+                if _offer_departments_list(phone, db, conversation, reset=True):
                     sess["awaiting"] = "department"
                     sess.pop("doctor_id", None)
                     db.commit()
@@ -1117,7 +1446,7 @@ def _handle_explicit_back(
                 sess["doctor_pick_mode"] = "by_specialty"
                 db.commit()
                 return True
-        ok = _offer_doctors_by_name_list(phone, db, conversation)
+        ok = _offer_doctors_by_name_list(phone, db, conversation, reset=True)
         if ok:
             sess["awaiting"] = "doctor"
             sess["doctor_pick_mode"] = "by_name"
@@ -1318,6 +1647,9 @@ def node_handle(state: GraphState) -> GraphState:
     ):
         return {**state, "handled": True}
 
+    if _try_handle_list_more(phone, db, conversation, sess, choice, text):
+        return {**state, "handled": True}
+
     # UC-002 rebook CTA after cancel (state may already be MAIN_MENU)
     if sess.get("awaiting") == "post_cancel":
         rebook = {
@@ -1516,9 +1848,8 @@ def node_handle(state: GraphState) -> GraphState:
 
     if conv_state == ConversationState.BOOKING_DOCTOR.value and not sess.get("doctor_id"):
         if _is_booking_path_choice(choice, text, i18n.PATH_SPECIALTY):
-            departments = doctor_service.list_departments(db, DEFAULT_CLINIC_ID)
             lang = _lang(conversation)
-            if not departments:
+            if not _offer_departments_list(phone, db, conversation, reset=True):
                 _offer_buttons(
                     phone,
                     i18n.no_departments(lang),
@@ -1527,28 +1858,6 @@ def node_handle(state: GraphState) -> GraphState:
                 sess["awaiting"] = "no_slots_alt"
                 db.commit()
                 return {**state, "handled": True}
-            _offer_list(
-                phone,
-                body=i18n.choose_specialty(lang),
-                button_label=i18n.specialties_label(lang),
-                rows=[
-                    {
-                        "id": f"dept_{d.department_id}",
-                        "title": (
-                            i18n.pick_bilingual_field(
-                                en=d.name_en,
-                                ar=d.name_ar,
-                                lang=lang,
-                                allow_cross_script=False,
-                                fallback=str(d.department_id),
-                            )
-                            or str(d.department_id)
-                        )[:24],
-                    }
-                    for d in departments
-                ],
-                section_title=i18n.specialties_label(lang),
-            )
             sess["awaiting"] = "department"
             db.commit()
             return {**state, "handled": True}
@@ -1562,7 +1871,7 @@ def node_handle(state: GraphState) -> GraphState:
 
         if _is_booking_path_choice(choice, text, i18n.PATH_BY_DOCTOR_NAME):
             # By doctor name → list names + specialties (not all cards at once)
-            ok = _offer_doctors_by_name_list(phone, db, conversation)
+            ok = _offer_doctors_by_name_list(phone, db, conversation, reset=True)
             if ok:
                 sess["awaiting"] = "doctor"
                 sess["doctor_pick_mode"] = "by_name"
@@ -1585,7 +1894,7 @@ def node_handle(state: GraphState) -> GraphState:
         if choice.startswith("doctor_"):
             doctor_id = int(choice.replace("doctor_", ""))
         elif sess.get("awaiting") == "doctor":
-            for doc in doctor_service.list_active_doctors(db, DEFAULT_CLINIC_ID, limit=20):
+            for doc in doctor_service.list_active_doctors(db, DEFAULT_CLINIC_ID, limit=50):
                 name_ar = (doc.name_ar or "").strip()
                 name_en = (doc.name_en or "").strip()
                 if (name_ar and name_ar in text) or (name_en and name_en.lower() in text.lower()):
@@ -1598,6 +1907,8 @@ def node_handle(state: GraphState) -> GraphState:
             if sess.get("doctor_pick_mode") == "by_name":
                 _show_selected_doctor_card(phone, db, doctor_id, lang=lang)
             sess.pop("doctor_pick_mode", None)
+            sess.pop("doctor_name_list_offset", None)
+            sess.pop("doctor_name_list_next_offset", None)
             continue_after_doctor_selected(db, phone=phone, doctor_id=doctor_id)
             return {**state, "handled": True}
 
@@ -1618,28 +1929,50 @@ def node_handle(state: GraphState) -> GraphState:
     if conv_state == ConversationState.BOOKING_DATE.value:
         if _sess_missing(phone, db, conversation, "doctor_id"):
             return {**state, "handled": True}
-        selected_date = choice.replace("date_", "") if choice.startswith("date_") else text
-        sess["selected_date"] = selected_date
+        lang = _lang(conversation, sess)
         avail = booking_service.get_available_dates_and_slots(
             db, doctor_id=sess["doctor_id"], clinic_id=DEFAULT_CLINIC_ID
         )
+        dates = list(avail.get("dates", {}).keys())
+        if choice.startswith("date_"):
+            selected_date = choice.replace("date_", "")
+        elif text in dates:
+            selected_date = text
+        else:
+            selected_date = None
+
+        if not selected_date or selected_date not in dates:
+            wa.send_text(phone, i18n.choose_day_from_list(lang))
+            if dates:
+                _offer_dates_list(
+                    phone, dates, lang, body=i18n.choose_day(lang), reset=True
+                )
+            db.commit()
+            return {**state, "handled": True}
+
+        sess["selected_date"] = selected_date
         day_slots = _filter_bookable_slots(
             avail.get("dates", {}).get(selected_date) or []
         )
         if not day_slots:
-            wa.send_text(phone, i18n.no_slots_on_day(_lang(conversation)))
+            wa.send_text(phone, i18n.no_slots_on_day(lang))
+            if dates:
+                _offer_dates_list(
+                    phone, dates, lang, body=i18n.choose_day(lang), reset=True
+                )
+            db.commit()
             return {**state, "handled": True}
         set_conversation_state(
             db, conversation, ConversationState.BOOKING_SLOT, current_intent="booking_slot"
         )
-        lang = _lang(conversation)
         date_label = _date_option_title(selected_date, lang)
-        _offer_list(
+        _offer_slots_list(
             phone,
+            day_slots,
+            lang,
             body=i18n.choose_slot_on_date(lang, date_label),
-            button_label=i18n.times_button_label(lang),
-            rows=_slot_rows_with_change_day(day_slots, lang),
-            section_title=i18n.slots_section_title(lang),
+            reset=True,
+            with_change_day=True,
         )
         db.commit()
         return {**state, "handled": True}
@@ -1648,12 +1981,14 @@ def node_handle(state: GraphState) -> GraphState:
     if conv_state == ConversationState.BOOKING_SLOT.value:
         if _sess_missing(phone, db, conversation, "doctor_id"):
             return {**state, "handled": True}
+        lang = _lang(conversation, sess)
         # "Change the day" from the time list → re-open the day picker.
         if choice == "change_day" or text == "change_day":
             _reshow_booking_dates(phone, db, conversation)
             return {**state, "handled": True}
         if not choice.startswith("slot_"):
-            wa.send_text(phone, i18n.choose_time_from_list(_lang(conversation)))
+            wa.send_text(phone, i18n.choose_time_from_list(lang))
+            _reshow_booking_slots(phone, db, conversation)
             return {**state, "handled": True}
         slot_id = int(choice.replace("slot_", ""))
         try:
@@ -1665,7 +2000,8 @@ def node_handle(state: GraphState) -> GraphState:
                 hold_minutes=SLOT_HOLD_MINUTES,
             )
         except BookingError as exc:
-            wa.send_text(phone, i18n.hold_error(_lang(conversation), str(exc)))
+            wa.send_text(phone, i18n.hold_error(lang, str(exc)))
+            _reshow_booking_slots(phone, db, conversation)
             return {**state, "handled": True}
         sess["slot_id"] = slot_id
         _store_hold_deadline(sess, hold_result)
@@ -1702,7 +2038,7 @@ def node_handle(state: GraphState) -> GraphState:
                 stored = patient_service.normalize_person_name(
                     sess.get("known_patient_name") or ""
                 )
-                if patient_service.is_triple_name(stored):
+                if patient_service.is_valid_person_name(stored):
                     sess["patient_name"] = stored
                     if _advance_after_patient_name(phone, sess, lang=lang):
                         db.commit()
@@ -1724,7 +2060,7 @@ def node_handle(state: GraphState) -> GraphState:
                 # Voice: "أنا اسمي علي محمود…" — accept a spoken triple name
                 # instead of only the Same patient / Name changed buttons.
                 cleaned = patient_service.normalize_person_name(text)
-                if patient_service.is_triple_name(cleaned):
+                if patient_service.is_valid_person_name(cleaned):
                     sess["patient_name"] = cleaned
                     _clear_options(phone)
                     if _advance_after_patient_name(phone, sess, lang=lang):
@@ -1743,7 +2079,7 @@ def node_handle(state: GraphState) -> GraphState:
 
         if sess.get("awaiting") == "patient_name":
             cleaned = patient_service.normalize_person_name(text)
-            if not patient_service.is_triple_name(cleaned):
+            if not patient_service.is_valid_person_name(cleaned):
                 wa.send_text(phone, i18n.patient_name_too_short(lang))
                 return {**state, "handled": True}
             # Overwrite any previous draft name (voice correction).
@@ -1924,16 +2260,8 @@ def node_handle(state: GraphState) -> GraphState:
                     db, clinic_id=DEFAULT_CLINIC_ID, whatsapp_phone=phone
                 )
                 if upcoming_rows:
-                    sess["upcoming"] = {
-                        str(a["appointment_id"]): _appt_session_info(a, lang)
-                        for a in upcoming_rows
-                    }
-                    _offer_list(
-                        phone,
-                        body=i18n.pick_appointment_to_reschedule(lang),
-                        button_label=i18n.your_appointments_label(lang),
-                        rows=[_appt_list_row(a, lang) for a in upcoming_rows[:10]],
-                        section_title=i18n.appointments_section(lang),
+                    _offer_upcoming_appointments_list(
+                        phone, db, conversation, purpose="reschedule", reset=False
                     )
                 db.commit()
                 return {**state, "handled": True}
@@ -2024,25 +2352,47 @@ def node_handle(state: GraphState) -> GraphState:
             return {**state, "handled": True}
 
         if awaiting == "date":
-            selected_date = choice.replace("date_", "") if choice.startswith("date_") else text
-            sess["selected_date"] = selected_date
             avail = booking_service.get_available_dates_and_slots(
                 db, doctor_id=sess["doctor_id"], clinic_id=DEFAULT_CLINIC_ID
             )
+            dates = list(avail.get("dates", {}).keys())
+            if choice.startswith("date_"):
+                selected_date = choice.replace("date_", "")
+            elif text in dates:
+                selected_date = text
+            else:
+                selected_date = None
+
+            if not selected_date or selected_date not in dates:
+                wa.send_text(phone, i18n.choose_day_from_list(lang))
+                if dates:
+                    _offer_dates_list(
+                        phone, dates, lang, body=i18n.choose_new_day(lang), reset=True
+                    )
+                db.commit()
+                return {**state, "handled": True}
+
+            sess["selected_date"] = selected_date
             day_slots = _filter_bookable_slots(
                 avail.get("dates", {}).get(selected_date) or []
             )
             if not day_slots:
                 wa.send_text(phone, i18n.no_slots_on_day(lang))
+                if dates:
+                    _offer_dates_list(
+                        phone, dates, lang, body=i18n.choose_new_day(lang), reset=True
+                    )
+                db.commit()
                 return {**state, "handled": True}
             sess["awaiting"] = "slot"
             date_label = _date_option_title(selected_date, lang)
-            _offer_list(
+            _offer_slots_list(
                 phone,
+                day_slots,
+                lang,
                 body=i18n.choose_new_time_on_date(lang, date_label),
-                button_label=i18n.times_button_label(lang),
-                rows=_slot_list_rows(day_slots, lang),
-                section_title=i18n.slots_section_title(lang),
+                reset=True,
+                with_change_day=False,
             )
             db.commit()
             return {**state, "handled": True}
@@ -2050,6 +2400,28 @@ def node_handle(state: GraphState) -> GraphState:
         if awaiting == "slot":
             if not choice.startswith("slot_"):
                 wa.send_text(phone, i18n.choose_time_from_list(lang))
+                selected_date = sess.get("selected_date")
+                if sess.get("doctor_id") and selected_date:
+                    avail = booking_service.get_available_dates_and_slots(
+                        db, doctor_id=sess["doctor_id"], clinic_id=DEFAULT_CLINIC_ID
+                    )
+                    day_slots = _filter_bookable_slots(
+                        avail.get("dates", {}).get(str(selected_date)) or []
+                    )
+                    if day_slots:
+                        date_label = _date_option_title(str(selected_date), lang)
+                        body = sess.get("list_slots_body") or i18n.choose_new_time_on_date(
+                            lang, date_label
+                        )
+                        _offer_slots_list(
+                            phone,
+                            day_slots,
+                            lang,
+                            body=body,
+                            reset=True,
+                            with_change_day=bool(sess.get("list_slots_with_change_day")),
+                        )
+                db.commit()
                 return {**state, "handled": True}
             slot_id = int(choice.replace("slot_", ""))
             try:
@@ -2062,6 +2434,28 @@ def node_handle(state: GraphState) -> GraphState:
                 )
             except BookingError as exc:
                 wa.send_text(phone, i18n.hold_error(lang, str(exc)))
+                selected_date = sess.get("selected_date")
+                if sess.get("doctor_id") and selected_date:
+                    avail = booking_service.get_available_dates_and_slots(
+                        db, doctor_id=sess["doctor_id"], clinic_id=DEFAULT_CLINIC_ID
+                    )
+                    day_slots = _filter_bookable_slots(
+                        avail.get("dates", {}).get(str(selected_date)) or []
+                    )
+                    if day_slots:
+                        date_label = _date_option_title(str(selected_date), lang)
+                        body = sess.get("list_slots_body") or i18n.choose_new_time_on_date(
+                            lang, date_label
+                        )
+                        _offer_slots_list(
+                            phone,
+                            day_slots,
+                            lang,
+                            body=body,
+                            reset=True,
+                            with_change_day=bool(sess.get("list_slots_with_change_day")),
+                        )
+                db.commit()
                 return {**state, "handled": True}
             sess["slot_id"] = slot_id
             _store_hold_deadline(sess, hold_result)
@@ -2173,16 +2567,8 @@ def node_handle(state: GraphState) -> GraphState:
                     db, clinic_id=DEFAULT_CLINIC_ID, whatsapp_phone=phone
                 )
                 if upcoming_rows:
-                    sess["upcoming"] = {
-                        str(a["appointment_id"]): _appt_session_info(a, lang)
-                        for a in upcoming_rows
-                    }
-                    _offer_list(
-                        phone,
-                        body=i18n.pick_appointment_to_cancel(lang),
-                        button_label=i18n.your_appointments_label(lang),
-                        rows=[_appt_list_row(a, lang) for a in upcoming_rows[:10]],
-                        section_title=i18n.appointments_section(lang),
+                    _offer_upcoming_appointments_list(
+                        phone, db, conversation, purpose="cancel", reset=False
                     )
                 db.commit()
                 return {**state, "handled": True}

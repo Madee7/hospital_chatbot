@@ -24,6 +24,34 @@ def name_part_count(name: str | None) -> int:
     return len(cleaned.split(" "))
 
 
+def is_valid_name_part(part: str) -> bool:
+    """One name token: letters only (AR/EN), optional internal ``-`` (e.g. El-Din).
+
+    Rejects emoji, digits, dots, and other punctuation. Requires at least two
+    letters across the whole token.
+    """
+    if not part or part.startswith("-") or part.endswith("-") or "--" in part:
+        return False
+    segments = part.split("-")
+    if any(not seg for seg in segments):
+        return False
+    if not all(ch.isalpha() for seg in segments for ch in seg):
+        return False
+    letter_count = sum(len(seg) for seg in segments)
+    return letter_count >= 2
+
+
+def is_valid_person_name(name: str | None) -> bool:
+    """At least three valid name parts (اسم ثلاثي بدون رموز)."""
+    cleaned = normalize_person_name(name)
+    if not cleaned:
+        return False
+    parts = cleaned.split(" ")
+    if len(parts) < 3:
+        return False
+    return all(is_valid_name_part(p) for p in parts)
+
+
 def is_triple_name(name: str | None) -> bool:
     """Require at least three name parts (اسم ثلاثي)."""
     return name_part_count(name) >= 3

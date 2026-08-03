@@ -71,11 +71,10 @@ Run from the repo root. `DATABASE_URL` comes from `.env` / `app.core.config`, no
 
 ## Documentation
 
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system components and request flow
-- [`docs/FLOWS.md`](docs/FLOWS.md) — booking / reschedule / cancel conversation flows
-- [`docs/DEPLOY.md`](docs/DEPLOY.md) — GitHub → server update steps
-- [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) — known limitations and workarounds
-- [`docs/WHATSAPP_FLOW_SETUP.md`](docs/WHATSAPP_FLOW_SETUP.md) — WhatsApp Flow setup notes
+Full project guide (architecture, flows, deploy, WhatsApp Flow setup):
+
+- [`docs/DOCUMENTATION.md`](docs/DOCUMENTATION.md)
+- PDF export: [`docs/pdf/DOCUMENTATION.pdf`](docs/pdf/DOCUMENTATION.pdf)
 
 ## Deploy Note
 

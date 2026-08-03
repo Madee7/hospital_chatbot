@@ -876,8 +876,7 @@ def _continue_booking_with_doctor(
         from app.graph.conversation_engine import (
             _date_option_title,
             _lang,
-            _offer_list,
-            _slot_rows_with_change_day,
+            _offer_slots_list,
         )
 
         day_slots = dates.get(date_key) or []
@@ -892,12 +891,13 @@ def _continue_booking_with_doctor(
             )
             lang = _lang(conversation)
             date_label = _date_option_title(date_key, lang)
-            _offer_list(
+            _offer_slots_list(
                 phone,
+                day_slots,
+                lang,
                 body=i18n.choose_slot_on_date(lang, date_label),
-                button_label=i18n.times_button_label(lang),
-                rows=_slot_rows_with_change_day(day_slots, lang),
-                section_title=i18n.slots_section_title(lang),
+                reset=True,
+                with_change_day=True,
             )
             db.commit()
             logger.info(
