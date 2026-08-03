@@ -1,4 +1,4 @@
-"""Convert docs/*.md to PDF via Chrome headless (best Arabic + layout)."""
+"""Convert docs/DOCUMENTATION.md to docs/pdf/DOCUMENTATION.pdf via Chrome."""
 from __future__ import annotations
 
 import re
@@ -15,92 +15,82 @@ out_dir.mkdir(exist_ok=True)
 html_dir.mkdir(exist_ok=True)
 
 CHROME = Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
-
-files = [
-    "ARCHITECTURE.md",
-    "FLOWS.md",
-    "DEPLOY.md",
-    "KNOWN_ISSUES.md",
-]
+SRC = docs / "DOCUMENTATION.md"
 
 css = """
-@page { size: A4; margin: 16mm; }
+@page { size: A4; margin: 14mm; }
 body {
   font-family: Tahoma, "Segoe UI", Arial, sans-serif;
-  font-size: 11pt;
+  font-size: 10.5pt;
   color: #111827;
-  line-height: 1.5;
-  max-width: 180mm;
+  line-height: 1.45;
 }
 h1 {
   color: #0f766e;
-  font-size: 22pt;
+  font-size: 20pt;
   border-bottom: 2px solid #0f766e;
   padding-bottom: 6px;
 }
 h2 {
   color: #134e4a;
-  font-size: 14pt;
-  margin-top: 18px;
+  font-size: 13pt;
+  margin-top: 16px;
   border-bottom: 1px solid #99f6e4;
-  padding-bottom: 4px;
+  padding-bottom: 3px;
+  page-break-after: avoid;
 }
 h3 {
   color: #115e59;
-  font-size: 12pt;
-  margin-top: 14px;
+  font-size: 11.5pt;
+  margin-top: 12px;
+  page-break-after: avoid;
 }
 blockquote {
   background: #ecfdf5;
   border-left: 4px solid #0f766e;
-  margin: 10px 0;
-  padding: 8px 12px;
+  margin: 8px 0;
+  padding: 6px 10px;
   color: #134e4a;
 }
 code {
   background: #f3f4f6;
-  color: #111827;
-  padding: 1px 4px;
+  padding: 1px 3px;
   border: 1px solid #e5e7eb;
   font-family: Consolas, "Courier New", monospace;
-  font-size: 9.5pt;
+  font-size: 9pt;
 }
 pre {
   background: #f8fafc;
-  color: #111827;
   border: 1px solid #cbd5e1;
   border-left: 4px solid #0f766e;
-  padding: 10px 12px;
-  font-size: 9pt;
+  padding: 8px 10px;
+  font-size: 8.5pt;
   white-space: pre-wrap;
   font-family: Consolas, "Courier New", monospace;
 }
-pre code {
-  background: transparent;
-  border: none;
-  padding: 0;
-}
+pre code { background: transparent; border: none; padding: 0; }
 table {
   border-collapse: collapse;
   width: 100%;
-  margin: 10px 0;
-  font-size: 10pt;
+  margin: 8px 0;
+  font-size: 9pt;
+  page-break-inside: avoid;
 }
 th {
   background: #0f766e;
   color: white;
   text-align: left;
-  padding: 7px 8px;
+  padding: 5px 6px;
 }
 td {
   border: 1px solid #d1d5db;
-  padding: 7px 8px;
+  padding: 5px 6px;
   vertical-align: top;
 }
 tr:nth-child(even) td { background: #f8fafc; }
-img { max-width: 100%; height: auto; margin: 10px 0; }
-hr { border: none; border-top: 1px solid #99f6e4; margin: 16px 0; }
-ul, ol { margin: 6px 0 6px 18px; }
+img { max-width: 100%; height: auto; margin: 8px 0; }
+hr { border: none; border-top: 1px solid #99f6e4; margin: 12px 0; }
+ul, ol { margin: 4px 0 4px 16px; }
 """
 
 
@@ -115,71 +105,45 @@ def fix_img_paths(html: str) -> str:
     return re.sub(r'src="([^"]+)"', repl, html)
 
 
-def open_target(name: str) -> Path:
-    target = out_dir / name
-    try:
-        with open(target, "wb"):
-            pass
-        return target
-    except PermissionError:
-        alt = docs / "pdf_readable" / name
-        alt.parent.mkdir(exist_ok=True)
-        return alt
+def main() -> None:
+    if not CHROME.exists():
+        raise SystemExit(f"Chrome not found: {CHROME}")
+    if not SRC.exists():
+        raise SystemExit(f"Missing {SRC}")
 
-
-def md_to_pdf(md_name: str) -> Path:
-    md_path = docs / md_name
-    text = md_path.read_text(encoding="utf-8")
+    text = SRC.read_text(encoding="utf-8")
     body = markdown.markdown(
-        text, extensions=["tables", "fenced_code", "sane_lists"]
+        text, extensions=["tables", "fenced_code", "sane_lists", "toc"]
     )
     body = fix_img_paths(body)
     html = (
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
         f"<style>{css}</style></head><body>{body}</body></html>"
     )
-    html_path = html_dir / f"{md_path.stem}.html"
+    html_path = html_dir / "DOCUMENTATION.html"
     html_path.write_text(html, encoding="utf-8")
-    pdf_path = open_target(f"{md_path.stem}.pdf")
+    pdf_path = out_dir / "DOCUMENTATION.pdf"
     if pdf_path.exists():
         try:
             pdf_path.unlink()
         except OSError:
             pass
-    cmd = [
-        str(CHROME),
-        "--headless=new",
-        "--disable-gpu",
-        "--no-pdf-header-footer",
-        f"--print-to-pdf={pdf_path}",
-        html_path.resolve().as_uri(),
-    ]
-    subprocess.run(cmd, check=False)
-    # Chrome may finish writing slightly after process exit
-    for _ in range(20):
+    subprocess.run(
+        [
+            str(CHROME),
+            "--headless=new",
+            "--disable-gpu",
+            "--no-pdf-header-footer",
+            f"--print-to-pdf={pdf_path}",
+            html_path.resolve().as_uri(),
+        ],
+        check=False,
+    )
+    for _ in range(30):
         if pdf_path.exists() and pdf_path.stat().st_size > 1000:
             break
         time.sleep(0.25)
-    return pdf_path
-
-
-def main() -> None:
-    if not CHROME.exists():
-        raise SystemExit(f"Chrome not found: {CHROME}")
-    ok_all = True
-    for name in files:
-        try:
-            pdf_path = md_to_pdf(name)
-            size = pdf_path.stat().st_size if pdf_path.exists() else 0
-            if size < 1000:
-                print("FAIL", name, "empty/missing pdf")
-                ok_all = False
-            else:
-                print("OK", pdf_path, size)
-        except Exception as exc:  # noqa: BLE001
-            print("FAIL", name, type(exc).__name__)
-            ok_all = False
-    print("done" if ok_all else "errors")
+    print("OK", pdf_path, pdf_path.stat().st_size if pdf_path.exists() else 0)
 
 
 if __name__ == "__main__":

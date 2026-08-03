@@ -80,7 +80,9 @@ def main_menu(lang: Any, clinic_name: str | None = None) -> str:
             "2. Reschedule appointment\n"
             "3. Cancel appointment\n"
             "4. Ask about doctors/specialties\n"
-            "5. Talk to reception"
+            "5. Talk to reception\n\n"
+            "To go one step back, type Back / Return.\n"
+            "To open the main menu, type Menu or قائمة."
         )
     return (
         f"أهلاً بك في {name}. كيف يمكننا مساعدتك؟\n"
@@ -88,7 +90,9 @@ def main_menu(lang: Any, clinic_name: str | None = None) -> str:
         "2. تعديل موعد\n"
         "3. إلغاء موعد\n"
         "4. الاستفسار عن الأطباء/التخصصات\n"
-        "5. التحدث مع موظف الاستقبال"
+        "5. التحدث مع موظف الاستقبال\n\n"
+        "للرجوع خطوة للخلف اكتب رجوع / عودة.\n"
+        "للرجوع للقائمة الرئيسية اكتب قائمة أو MENU."
     )
 
 
@@ -116,8 +120,14 @@ def menu_button_label(lang: Any) -> str:
 
 def type_menu_hint(lang: Any) -> str:
     if is_english(lang):
-        return "Type MENU anytime to open the menu."
-    return "اكتب MENU في أي وقت لفتح القائمة."
+        return (
+            "To go one step back, type Back / Return. "
+            "To open the main menu, type Menu or قائمة."
+        )
+    return (
+        "للرجوع خطوة للخلف اكتب رجوع / عودة. "
+        "للرجوع للقائمة الرئيسية اكتب قائمة أو MENU."
+    )
 
 
 def thanks_ack(lang: Any) -> str:
@@ -162,6 +172,102 @@ def doctors_by_name_prompt(lang: Any) -> str:
 
 def doctors_list_button_label(lang: Any) -> str:
     return "Doctors" if is_english(lang) else "الأطباء"
+
+
+DOCTORS_MORE_ID = "list_more"
+LIST_MORE_ID = "list_more"
+LIST_MORE_CHOICES = {"المزيد", "More", "more", LIST_MORE_ID, "more_doctors"}
+DOCTORS_MORE_CHOICES = LIST_MORE_CHOICES
+
+
+def list_more_row(lang: Any, *, description: str | None = None) -> dict[str, str]:
+    if is_english(lang):
+        return {
+            "id": LIST_MORE_ID,
+            "title": "More",
+            "description": (description or "Next page")[:72],
+        }
+    return {
+        "id": LIST_MORE_ID,
+        "title": "المزيد",
+        "description": (description or "الصفحة التالية")[:72],
+    }
+
+
+def doctors_more_row(lang: Any) -> dict[str, str]:
+    if is_english(lang):
+        return list_more_row(lang, description="Next doctors")
+    return list_more_row(lang, description="أطباء الصفحة التالية")
+
+
+def is_list_more_choice(choice: str | None, text: str | None = None) -> bool:
+    c = (choice or "").strip()
+    t = (text or "").strip()
+    return c in LIST_MORE_CHOICES or t in LIST_MORE_CHOICES
+
+
+def paginated_list_body(
+    lang: Any,
+    *,
+    first_page: str,
+    topic: str,
+    page: int = 1,
+    has_more: bool = False,
+    more_hint: str | None = None,
+) -> str:
+    """WhatsApp list body for any page (1, 2, 3, …)."""
+    page = max(1, int(page or 1))
+    if is_english(lang):
+        hint = more_hint or (
+            "If you don't find what you need, choose More to see the next page."
+        )
+        if page <= 1:
+            return f"{first_page}\n\n{hint}" if has_more else first_page
+        lines = [f"{topic} — page {page}", first_page]
+        if has_more:
+            lines.append(hint)
+        return "\n".join(lines)
+
+    hint = more_hint or (
+        "إذا لم تجد المطلوب اختر المزيد لعرض الصفحة التالية."
+    )
+    if page <= 1:
+        return f"{first_page}\n\n{hint}" if has_more else first_page
+    lines = [f"{topic} — الصفحة {page}", first_page]
+    if has_more:
+        lines.append(hint)
+    return "\n".join(lines)
+
+
+def doctors_list_more_hint(lang: Any) -> str:
+    if is_english(lang):
+        return "If you don't find the doctor you need, choose More to see the next page."
+    return "إذا لم تجد الدكتور المطلوب اختر المزيد لعرض الصفحة التالية."
+
+
+def specialties_list_more_hint(lang: Any) -> str:
+    if is_english(lang):
+        return "If you don't find the specialty you need, choose More to see the next page."
+    return "إذا لم تجد التخصص المطلوب اختر المزيد لعرض الصفحة التالية."
+
+
+def days_list_more_hint(lang: Any) -> str:
+    if is_english(lang):
+        return "If you don't find the day you need, choose More to see the next page."
+    return "إذا لم تجد اليوم المطلوب اختر المزيد لعرض الصفحة التالية."
+
+
+def times_list_more_hint(lang: Any) -> str:
+    if is_english(lang):
+        return "If you don't find the time you need, choose More to see the next page."
+    return "إذا لم تجد الموعد المطلوب اختر المزيد لعرض الصفحة التالية."
+
+
+def appointments_list_more_hint(lang: Any) -> str:
+    if is_english(lang):
+        return "If you don't find the appointment you need, choose More to see the next page."
+    return "إذا لم تجد الموعد المطلوب اختر المزيد لعرض الصفحة التالية."
+
 
 
 def confirmation(
@@ -817,11 +923,11 @@ def choose_doctor_button(lang: Any, name: str) -> str:
 def ask_patient_full_name(lang: Any) -> str:
     if is_english(lang):
         return (
-            "Please enter the patient's full name (at least three names).\n"
+            "Please enter the patient's full name (three names).\n"
             "Example: Ahmed Mohamed Ali"
         )
     return (
-        "برجاء إدخال الاسم الثلاثي للمريض (ثلاثة أسماء على الأقل).\n"
+        "برجاء إدخال الاسم الثلاثي للمريض.\n"
         "مثال: أحمد محمد علي"
     )
 
@@ -829,12 +935,14 @@ def ask_patient_full_name(lang: Any) -> str:
 def patient_name_too_short(lang: Any) -> str:
     if is_english(lang):
         return (
-            "The name must include at least three parts (full name).\n"
-            "Please enter it again. Example: Ahmed Mohamed Ali"
+            "Please enter a valid full name: at least three parts, letters only "
+            "(no emoji or symbols), each part at least 2 letters.\n"
+            "Example: Ahmed Mohamed Ali"
         )
     return (
-        "الاسم يجب أن يكون ثلاثياً على الأقل.\n"
-        "برجاء إعادة الإدخال. مثال: أحمد محمد علي"
+        "برجاء إدخال اسم ثلاثي صحيح: حروف فقط (بدون إيموجي أو رموز)، "
+        "وكل جزء حرفين على الأقل.\n"
+        "مثال: أحمد محمد علي"
     )
 
 
@@ -929,9 +1037,10 @@ def invalid_dob(lang: Any) -> str:
 def complete_profile_name(lang: Any) -> str:
     if is_english(lang):
         return (
-            "Please enter your full name (at least three names) to complete your profile."
+            "Please enter your full name (at least three names, letters only) "
+            "to complete your profile."
         )
-    return "برجاء إدخال اسمك الثلاثي لإكمال ملفك."
+    return "برجاء إدخال اسمك الثلاثي (حروف فقط) لإكمال ملفك."
 
 
 def no_upcoming_to_reschedule(lang: Any) -> str:
@@ -1128,6 +1237,12 @@ def no_slots_on_day(lang: Any) -> str:
     return "لا توجد أوقات في هذا اليوم. اختر يوماً آخر."
 
 
+def choose_day_from_list(lang: Any) -> str:
+    if is_english(lang):
+        return "Please choose a day from the list."
+    return "برجاء اختيار يوم من القائمة."
+
+
 def choose_slot_on_date(lang: Any, date_label: str) -> str:
     if is_english(lang):
         return f"Choose a 30-min slot on {date_label}:"
@@ -1143,7 +1258,7 @@ def choose_new_time_on_date(lang: Any, date_label: str) -> str:
 def choose_time_from_list(lang: Any) -> str:
     if is_english(lang):
         return "Please choose a time from the list."
-    return "اختر الوقت من القائمة."
+    return "برجاء اختيار وقت من القائمة."
 
 
 def voice_resend(lang: Any) -> str:

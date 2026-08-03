@@ -849,7 +849,7 @@ def _present_doctor_list(db: Session, phone: str, conversation) -> bool:
     set_conversation_state(
         db, conversation, ConversationState.BOOKING_DOCTOR, current_intent="voice_v2_doctors"
     )
-    ok = _offer_doctors_by_name_list(phone, db, conversation)
+    ok = _offer_doctors_by_name_list(phone, db, conversation, reset=True)
     db.commit()
     return bool(ok)
 
@@ -889,8 +889,7 @@ def _present_slots(
 ) -> bool:
     from app.graph.conversation_engine import (
         _date_option_title,
-        _offer_list,
-        _slot_rows_with_change_day,
+        _offer_slots_list,
     )
 
     sess = _sess(phone)
@@ -901,12 +900,13 @@ def _present_slots(
         db, conversation, ConversationState.BOOKING_SLOT, current_intent="voice_v2_slots"
     )
     lang = _lang(conversation, phone)
-    _offer_list(
+    _offer_slots_list(
         phone,
+        day_slots,
+        lang,
         body=i18n.choose_slot_on_date(lang, _date_option_title(date_key, lang)),
-        button_label=i18n.times_button_label(lang),
-        rows=_slot_rows_with_change_day(day_slots, lang),
-        section_title=i18n.slots_section_title(lang),
+        reset=True,
+        with_change_day=True,
     )
     db.commit()
     return True
@@ -938,7 +938,7 @@ def _step_show_menu(db: Session, phone: str, plan: VoicePlan, conversation) -> E
 
 def _step_ask_specialty(db: Session, phone: str, plan: VoicePlan, conversation) -> ExecResult:
     """No usable doctor/specialty yet → open the department list."""
-    from app.graph.conversation_engine import _offer_list
+    from app.graph.conversation_engine import _offer_departments_list
 
     departments = doctor_service.list_departments(db, DEFAULT_CLINIC_ID)
     if not departments:
@@ -953,30 +953,13 @@ def _step_ask_specialty(db: Session, phone: str, plan: VoicePlan, conversation) 
             reason="no_departments",
         )
 
-    lang = _lang(conversation, phone)
     sess = _sess(phone)
     sess["flow"] = sess.get("flow") or "booking"
     sess["awaiting"] = "department"
     set_conversation_state(
         db, conversation, ConversationState.BOOKING_DOCTOR, current_intent="voice_v2_departments"
     )
-    rows = [
-        {
-            "id": f"dept_{d.department_id}",
-            "title": (
-                (d.name_en or d.name_ar) if i18n.is_english(lang) else (d.name_ar or d.name_en)
-            or "")[:24],
-            "description": "",
-        }
-        for d in departments[:10]
-    ]
-    _offer_list(
-        phone,
-        body=i18n.choose_specialty(lang),
-        button_label=i18n.specialties_label(lang),
-        rows=rows,
-        section_title=i18n.specialties_label(lang),
-    )
+    _offer_departments_list(phone, db, conversation, reset=True)
     db.commit()
     return ExecResult(handled=True, step="ask_specialty", requested_step="ask_specialty")
 
