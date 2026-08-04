@@ -8,6 +8,7 @@ import os
 import re
 import tempfile
 import time
+from datetime import date, timedelta
 from typing import Any, Callable, TypeVar
 
 import openai
@@ -42,6 +43,28 @@ T = TypeVar("T")
 _STT_PROMPT_CACHE: dict[int, tuple[float, str]] = {}
 _STT_PROMPT_TTL_SEC = 600.0  # 10 minutes
 _STT_PROMPT_MAX_CHARS = 500
+
+
+def _calendar_context_block(today: date | None = None) -> str:
+    """Precomputed TODAY / TOMORROW / DAY_AFTER for the LLM user message.
+
+    Keeps relative Arabic (بكرة / بعد بكرة) from inventing wrong ISO dates.
+    Volatile — must stay in the user message, never in PLANNER_SYSTEM.
+    """
+    today = today or date.today()
+    tomorrow = today + timedelta(days=1)
+    day_after = today + timedelta(days=2)
+    return (
+        f"CALENDAR (use these exact ISO dates for relative words):\n"
+        f"TODAY={today.isoformat()} (weekday={today.strftime('%A')})\n"
+        f"TOMORROW={tomorrow.isoformat()} (weekday={tomorrow.strftime('%A')})  "
+        f"← بكرة / بكره / بكرا / غداً / tomorrow\n"
+        f"DAY_AFTER_TOMORROW={day_after.isoformat()} "
+        f"(weekday={day_after.strftime('%A')})  "
+        f"← بعد بكرة / بعد بكره / بعد غد / day after tomorrow\n"
+        "If the transcript says بعد بكرة (or بعد بكره), use DAY_AFTER_TOMORROW, "
+        "NOT TOMORROW. Always set slots.date / date_hint to the ISO string.\n"
+    )
 
 _SYSTEM = """You are an intelligent router for New Giza University Hospital's WhatsApp chatbot.
 Patients speak Egyptian Arabic. Your job is to extract maximum information and route efficiently.
@@ -117,25 +140,33 @@ ACTION TYPES (choose exactly ONE)
   clearly asking about doctors/availability, do NOT use clarify.
 
 ========================================================================
-DATE PARSING RULES (always convert to YYYY-MM-DD)
+DATE PARSING RULES (always convert to concrete YYYY-MM-DD)
 ========================================================================
-TODAY={actual_date} (weekday={weekday_name}) is provided in the user message.
-All relative dates MUST be calculated from TODAY.
+The user message gives a CALENDAR block with precomputed dates:
+  TODAY=…  TOMORROW=…  DAY_AFTER_TOMORROW=…
+Copy the matching ISO into date_hint. Never invent years; never leave
+date_hint null when بكرة / بعد بكرة was spoken; never write the word
+"tomorrow" — only YYYY-MM-DD.
 
-Relative keywords:
-  النهاردة / اليوم  -> TODAY
-  بكرة / غداً / tomorrow -> TODAY + 1 day
-  بعد بكرة / بعد غد / day after tomorrow / after tomorrow -> TODAY + 2 days
-  أمبارح / امس      -> TODAY - 1 day (past)
+Relative keywords (check "بعد بكرة" BEFORE bare "بكرة" — substring overlap):
+  بعد بكرة / بعد بكره / بعد بكرا / بعد غد / day after tomorrow / after tomorrow
+      -> date_hint = DAY_AFTER_TOMORROW
+  بكرة / بكره / بكرا / غداً / tomorrow / bukra
+      -> date_hint = TOMORROW
+  النهاردة / اليوم / today -> date_hint = TODAY
+  أمبارح / امس -> past (not bookable)
 
 Weekdays alone (الأحد/الإثنين/…/السبت or Sunday/…) -> the NEXT occurrence
 of that weekday from TODAY.
 If weekday + calendar date together (Friday 14-8, الجمعة 14/8) -> use the
 calendar date as DD-MM (14 August), NOT the nearest Friday/Saturday/etc.
 
-Examples (if TODAY = 2026-08-04, Tuesday):
-  "بكرة" -> 2026-08-05 ; "يوم الأحد" -> 2026-08-09 ; "friday" -> 2026-08-07 ;
-  "Friday 14-8" / "الجمعة 14-8" -> 2026-08-14 (not 2026-08-07).
+Examples (when CALENDAR says TODAY=2026-08-04, TOMORROW=2026-08-05,
+DAY_AFTER_TOMORROW=2026-08-06):
+  "بكرة" / "بكره" -> 2026-08-05
+  "بعد بكرة" / "بعد بكره" -> 2026-08-06  (NOT 2026-08-05)
+  "يوم الأحد" -> next Sunday ; "friday" -> next Friday
+  "Friday 14-8" / "الجمعة 14-8" -> 2026-08-14 (not nearest Friday).
 OUTPUT FORMAT: always YYYY-MM-DD.
 
 ========================================================================
@@ -165,7 +196,7 @@ CURRENT_STEP (when provided) means the patient is mid-booking. Fields:
 awaiting, known_doctor, known_specialty, known_date.
 
 1. COMPLETE THE CURRENT STEP FIRST.
-   awaiting="date" and user says "بكرة" -> date_hint="<tomorrow>"; do NOT treat as
+   awaiting="date" and user says "بكرة" -> date_hint=TOMORROW ISO; do NOT treat as
    unclear/new request; use select_option if a matching date_* is in OPTIONS_JSON.
 2. PRESERVE KNOWN CONTEXT.
    known_doctor set and user says "الساعة 2" -> still carry doctor_hint and add
@@ -206,7 +237,7 @@ Intent recognition: "عايز اعدل"/"اغير الموعد"/"تغيير ال
    "اغير اليوم"/"اغير التاريخ" -> change_target="date"
    (action="intent", intent="update")
 2) NEW VALUE mentioned:
-   "غير الموعد لبكرة" -> date_hint="<tomorrow>"
+   "غير الموعد لبكرة" -> date_hint=TOMORROW ISO; "بعد بكرة" -> DAY_AFTER_TOMORROW ISO
    "اغير للساعة 3" -> time_hint="15:00"
    "اغير للدكتور أحمد" -> doctor_hint="أحمد"
    If both WHAT and NEW VALUE present, use book_direct/specialty_direct and extract hints.
@@ -664,14 +695,7 @@ def _understand_via_gpt_text(
         )
         catalog = _options_catalog(options)
         # Calendar context in the *user* message only (system prompt unchanged).
-        # Without TODAY, GPT invents stale years (prod: date_hint='2023-10-31').
-        from datetime import date as _date
-
-        today = _date.today()
-        today_line = (
-            f"TODAY={today.isoformat()} (weekday={today.strftime('%A')}). "
-            "Resolve weekdays/relative days relative to TODAY into YYYY-MM-DD.\n"
-        )
+        # Without TODAY/TOMORROW, GPT invents stale years or wrong +1/+2 days.
         step_line = _format_current_step_line(current_step)
         completion = parse_fn(
             model=OPENAI_VOICE_STRUCTURE_MODEL or OPENAI_MODEL,
@@ -681,7 +705,7 @@ def _understand_via_gpt_text(
                 {
                     "role": "user",
                     "content": (
-                        today_line
+                        _calendar_context_block()
                         + step_line
                         + f"OPTIONS_JSON={json.dumps(catalog, ensure_ascii=False)}\n"
                         f"TRANSCRIPT: {transcript}\n"
@@ -733,9 +757,6 @@ def _plan_via_gpt_text(
             or client.beta.chat.completions.parse
         )
         catalog = _options_catalog(options)
-        from datetime import date as _date
-
-        today = _date.today()
         completion = parse_fn(
             model=OPENAI_VOICE_STRUCTURE_MODEL or OPENAI_MODEL,
             temperature=0,
@@ -744,11 +765,11 @@ def _plan_via_gpt_text(
                 {
                     "role": "user",
                     "content": (
-                        f"TODAY={today.isoformat()} (weekday={today.strftime('%A')})\n"
-                        f"CURRENT_STEP={json.dumps(current_step or {}, ensure_ascii=False)}\n"
-                        f"OPTIONS_JSON={json.dumps(catalog, ensure_ascii=False)}\n"
-                        f"TRANSCRIPT: {transcript}\n"
-                        "Return the structured VoicePlan."
+                        _calendar_context_block()
+                        + f"CURRENT_STEP={json.dumps(current_step or {}, ensure_ascii=False)}\n"
+                        + f"OPTIONS_JSON={json.dumps(catalog, ensure_ascii=False)}\n"
+                        + f"TRANSCRIPT: {transcript}\n"
+                        + "Return the structured VoicePlan."
                     ),
                 },
             ],

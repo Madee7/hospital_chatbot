@@ -244,3 +244,15 @@ def test_normalize_date_hint_accepts_day_month_without_year():
     today = date(2026, 8, 4)
     assert _normalize_date_hint("14-8", today=today, window_days=21) == "2026-08-14"
     assert _normalize_date_hint("14/8/2026", today=today, window_days=21) == "2026-08-14"
+
+
+def test_calendar_context_block_precomputes_bukra_dates():
+    from app.services.voice_service import _calendar_context_block
+
+    today = date(2026, 8, 4)
+    block = _calendar_context_block(today)
+    assert "TODAY=2026-08-04" in block
+    assert "TOMORROW=2026-08-05" in block
+    assert "DAY_AFTER_TOMORROW=2026-08-06" in block
+    assert "بكرة" in block
+    assert "بعد بكرة" in block

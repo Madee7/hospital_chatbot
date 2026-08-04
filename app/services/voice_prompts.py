@@ -179,12 +179,25 @@ A partial or nickname ("محمد") still goes in doctor_name — the executor
 resolves it against the real doctor list and handles a miss.
 
 ========================================================================
-DATE PARSING (always output YYYY-MM-DD)
+DATE PARSING (always output concrete YYYY-MM-DD in slots.date)
 ========================================================================
-TODAY is given in the user message; resolve everything relative to it.
-  النهاردة / اليوم / today              -> TODAY
-  بكرة / غداً / tomorrow                -> TODAY + 1
-  بعد بكرة / بعد غد / day after tomorrow / after tomorrow -> TODAY + 2
+The user message gives a CALENDAR block:
+  TODAY=YYYY-MM-DD (weekday=…)
+  TOMORROW=YYYY-MM-DD (weekday=…)          ← TODAY + 1
+  DAY_AFTER_TOMORROW=YYYY-MM-DD (weekday=…) ← TODAY + 2
+You MUST copy the matching ISO date into slots.date. Do NOT invent a year,
+do NOT leave date null when a relative day was spoken, and do NOT output
+the word "tomorrow" — only YYYY-MM-DD.
+
+Relative keywords (check LONGER phrases first — "بعد بكرة" contains "بكرة"):
+  بعد بكرة / بعد بكره / بعد بكرا / بعد غد / بعد الغد /
+  day after tomorrow / after tomorrow
+      -> slots.date = DAY_AFTER_TOMORROW (exactly as given)
+  بكرة / بكره / بكرا / غداً / غدا / tomorrow / bukra / bokra
+      -> slots.date = TOMORROW (exactly as given)
+  النهاردة / اليوم / today
+      -> slots.date = TODAY
+
 Weekday names (الأحد/الإثنين/…/السبت or Sunday/Monday/…) alone -> the NEXT
 occurrence of that weekday on or after TODAY (prefer a day with open slots).
 If the user ALSO gives a calendar date (14-8, 14/8, 14-08-2026, ١٤-٨),
@@ -218,7 +231,9 @@ awaiting / known_doctor / known_specialty / known_date.
 1. CARRY CONTEXT FORWARD. known_doctor="أحمد" + "الساعة 2" -> doctor_name="أحمد",
    time="14:00", next_step=hold_slot. Never drop a known slot.
 2. SHORT ANSWERS COMPLETE THE STEP, they are not new requests. awaiting="date"
-   + "بكرة" -> date=tomorrow, next_step=show_slots. Never clarify these.
+   + "بكرة"/"بكره" -> slots.date=TOMORROW (ISO from the CALENDAR block),
+   next_step=show_slots. + "بعد بكرة" -> slots.date=DAY_AFTER_TOMORROW.
+   Never clarify these; never leave date null when they said بكرة/بعد بكرة.
 3. AT awaiting="patient_name", the transcript is the patient's NAME:
    patient_name=<transcript>, goal=book_new, next_step=confirm_booking.
    Do NOT read it as a doctor. EXCEPTION: if they clearly voice a different
