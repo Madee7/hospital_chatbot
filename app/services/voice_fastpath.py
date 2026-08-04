@@ -406,39 +406,159 @@ def _parse_time_to_hm(time_hint: str) -> tuple[int, int] | None:
     return hour, minute
 
 
+def _fit_calendar_date(
+    parsed: date,
+    *,
+    today: date,
+    window_days: int,
+    available: set[str] | None = None,
+) -> str | None:
+    """Accept a calendar date if bookable (in window and/or in available keys)."""
+    if parsed < today:
+        return None
+    iso = parsed.isoformat()
+    if available is not None:
+        return iso if iso in available else None
+    if parsed <= today + timedelta(days=window_days):
+        return iso
+    return None
+
+
+def _resolve_day_month(
+    day_n: int,
+    month_n: int,
+    year_n: int | None,
+    *,
+    today: date,
+    window_days: int,
+    available: set[str] | None = None,
+) -> str | None:
+    """Resolve DD-MM (clinic / MENA) optionally with year; prefer dates in `available`."""
+    years: list[int]
+    if year_n is not None:
+        years = [year_n]
+    else:
+        years = [today.year, today.year + 1]
+
+    for y in years:
+        try:
+            parsed = date(y, month_n, day_n)
+        except ValueError:
+            continue
+        fitted = _fit_calendar_date(
+            parsed, today=today, window_days=window_days, available=available
+        )
+        if fitted:
+            return fitted
+
+    # Explicit day/month: allow matching an offered slot day even if outside window
+    if available is not None and year_n is None:
+        for iso in sorted(available):
+            try:
+                ad = date.fromisoformat(iso)
+            except ValueError:
+                continue
+            if ad >= today and ad.day == day_n and ad.month == month_n:
+                return iso
+    return None
+
+
+def _extract_explicit_calendar_dates(
+    text: str | None,
+    *,
+    today: date,
+    window_days: int = 14,
+    available: set[str] | None = None,
+) -> list[str]:
+    """Pull calendar dates from speech/text (14-8, 14/8, 2026-08-14), DD-MM first."""
+    if not text:
+        return []
+    blob = text.translate(_AR_DIGIT_TRANS)
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def _add(iso: str | None) -> None:
+        if iso and iso not in seen:
+            seen.add(iso)
+            found.append(iso)
+
+    for m in re.finditer(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", blob):
+        try:
+            parsed = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            continue
+        _add(
+            _fit_calendar_date(
+                parsed, today=today, window_days=window_days, available=available
+            )
+        )
+
+    # DD-MM or DD-MM-YYYY (and DD.MM). Do not use ':' (avoids 14:00 times).
+    for m in re.finditer(
+        r"\b(\d{1,2})\s*[./\-]\s*(\d{1,2})(?:\s*[./\-]\s*(\d{2,4}))?\b",
+        blob,
+    ):
+        a, b = int(m.group(1)), int(m.group(2))
+        year_raw = m.group(3)
+        year_n: int | None = None
+        if year_raw is not None:
+            year_n = int(year_raw)
+            if year_n < 100:
+                year_n += 2000
+        # Prefer DD-MM (14-8 -> 14 Aug). If invalid, try MM-DD.
+        iso = _resolve_day_month(
+            a,
+            b,
+            year_n,
+            today=today,
+            window_days=window_days,
+            available=available,
+        )
+        if not iso and a <= 12 and b <= 31:
+            iso = _resolve_day_month(
+                b,
+                a,
+                year_n,
+                today=today,
+                window_days=window_days,
+                available=available,
+            )
+        _add(iso)
+
+    return found
+
+
 def _normalize_date_hint(
     date_hint: str | None,
     *,
     today: date | None = None,
     window_days: int = 14,
+    available: set[str] | None = None,
 ) -> str | None:
-    """Strict YYYY-MM-DD inside [today, today+window]; reject stale GPT years."""
+    """YYYY-MM-DD or DD-MM[/YYYY] inside booking window; reject stale GPT years."""
     if not date_hint:
         return None
     today = today or date.today()
-    s = date_hint.strip()
-    parsed: date | None = None
-    m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})", s)
+    extracted = _extract_explicit_calendar_dates(
+        date_hint.strip().translate(_AR_DIGIT_TRANS),
+        today=today,
+        window_days=window_days,
+        available=available,
+    )
+    if extracted:
+        return extracted[0]
+    # Whole-string legacy: bare ISO without word boundaries
+    s = date_hint.strip().translate(_AR_DIGIT_TRANS)
+    m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", s)
     if m:
         try:
             parsed = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
         except ValueError:
             return None
-    else:
-        m = re.match(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})", s)
-        if m:
-            day_n, month_n, year_n = int(m.group(1)), int(m.group(2)), int(m.group(3))
-            if year_n < 100:
-                year_n += 2000
-            try:
-                parsed = date(year_n, month_n, day_n)
-            except ValueError:
-                return None
-    if parsed is None:
-        return None
-    if parsed < today or parsed > today + timedelta(days=window_days):
-        return None
-    return parsed.isoformat()
+        return _fit_calendar_date(
+            parsed, today=today, window_days=window_days, available=available
+        )
+    return None
 
 
 def _normalize_time_hint(
@@ -498,7 +618,15 @@ def resolve_date_key(
     today: date | None = None,
     window_days: int = 14,
 ) -> str | None:
-    """Resolve spoken/relative date to YYYY-MM-DD, optionally constrained to available keys."""
+    """Resolve spoken/relative date to YYYY-MM-DD, optionally constrained to available keys.
+
+    Priority:
+      1) Relative words (today / tomorrow / day-after)
+      2) Explicit calendar date in transcript (14-8, 14/8, ISO)
+         — wins over bare weekday so "Friday 14-8" → 14 Aug, not next Friday
+      3) Bare weekday → next occurrence (prefer a day with openings)
+      4) Planner date_hint if nothing else resolved
+    """
     today = today or date.today()
     # Prefer transcript for relative/weekday words; ignore stale GPT ISO in the blob
     # so a bad year like 2023-10-31 does not pollute matching.
@@ -516,37 +644,60 @@ def resolve_date_key(
     elif any(w in blob for w in _RELATIVE_TODAY):
         candidates.append(today.isoformat())
 
-    # Weekdays from speech (longer Arabic names first; EN monday/…).
-    # Prefer the next weekday that actually has openings when `available` is set.
-    weekday_matched = False
-    ar_names = sorted(_WEEKDAY_AR.items(), key=lambda kv: len(_norm_ar(kv[0])), reverse=True)
-    for name, wd in ar_names:
-        if _norm_ar(name) not in blob:
-            continue
-        iso = _next_weekday_iso(
-            today, wd, available=available, window_days=window_days
+    # Explicit calendar date from the user's words (14-8, 14/8, ISO in transcript).
+    # Wins over bare weekday so "Friday 14-8" → 14 Aug, not next Friday.
+    # Resolve without `available` so a full day still selects that date (not nearest weekday).
+    explicit_speech = _extract_explicit_calendar_dates(
+        transcript,
+        today=today,
+        window_days=window_days,
+        available=None,
+    )
+    normalized_hint = _normalize_date_hint(
+        date_hint,
+        today=today,
+        window_days=window_days,
+        available=None,
+    )
+
+    if not candidates and explicit_speech:
+        candidates.extend(explicit_speech)
+    elif not candidates:
+        # Bare weekday from speech (ignore GPT date_hint until after — stale years / wrong day).
+        ar_names = sorted(
+            _WEEKDAY_AR.items(), key=lambda kv: len(_norm_ar(kv[0])), reverse=True
         )
-        if iso:
-            candidates.append(iso)
-        weekday_matched = True
-        break
-    if not weekday_matched:
-        for name, wd in _WEEKDAY_EN.items():
-            if name not in blob:
+        weekday_matched = False
+        for name, wd in ar_names:
+            if _norm_ar(name) not in blob:
                 continue
             iso = _next_weekday_iso(
                 today, wd, available=available, window_days=window_days
             )
             if iso:
                 candidates.append(iso)
+            weekday_matched = True
             break
+        if not weekday_matched:
+            for name, wd in _WEEKDAY_EN.items():
+                if name not in blob:
+                    continue
+                iso = _next_weekday_iso(
+                    today, wd, available=available, window_days=window_days
+                )
+                if iso:
+                    candidates.append(iso)
+                break
+        # No relative/weekday/speech date → fall back to planner date_hint
+        if not candidates and normalized_hint:
+            candidates.append(normalized_hint)
+    elif explicit_speech:
+        candidates.extend(explicit_speech)
 
-    # GPT / explicit ISO only if inside booking window (drops 2023 hallucinations)
-    normalized = _normalize_date_hint(
-        date_hint, today=today, window_days=window_days
-    )
-    if normalized:
-        candidates.append(normalized)
+    # Secondary: planner hint after speech-derived candidates (availability tie-break)
+    if normalized_hint and normalized_hint not in candidates:
+        if explicit_speech or candidates:
+            candidates.append(normalized_hint)
 
     # Dedupe preserve order
     seen: set[str] = set()

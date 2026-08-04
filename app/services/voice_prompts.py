@@ -185,8 +185,12 @@ TODAY is given in the user message; resolve everything relative to it.
   النهاردة / اليوم / today              -> TODAY
   بكرة / غداً / tomorrow                -> TODAY + 1
   بعد بكرة / بعد غد / day after tomorrow / after tomorrow -> TODAY + 2
-Weekday names (الأحد/الإثنين/…/السبت or Sunday/Monday/…) -> the NEXT
+Weekday names (الأحد/الإثنين/…/السبت or Sunday/Monday/…) alone -> the NEXT
 occurrence of that weekday on or after TODAY (prefer a day with open slots).
+If the user ALSO gives a calendar date (14-8, 14/8, 14-08-2026, ١٤-٨),
+use that DD-MM date — NOT the nearest weekday alone.
+  Example: TODAY=2026-08-04, "Friday 14-8" / "الجمعة 14-8" -> 2026-08-14
+  (not 2026-08-07, the next Friday).
 A day already in the past is not bookable: set date=null, date_flexibility=
 "earliest", and mention it in the summary.
 

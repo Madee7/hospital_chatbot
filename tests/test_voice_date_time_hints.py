@@ -187,3 +187,60 @@ def test_bare_monday_skips_unavailable_to_following_week():
     )
     assert key == second_mon
     assert key != first_mon
+
+
+def test_weekday_plus_day_month_uses_calendar_date_not_nearest_weekday():
+    """'Friday 14-8' → 14 Aug, not the next Friday."""
+    today = date(2026, 8, 4)  # Tuesday
+    target = "2026-08-14"  # Friday
+    next_fri = "2026-08-07"
+    window = {(today + timedelta(days=i)).isoformat() for i in range(21)}
+    for text in (
+        "friday 14-8",
+        "Friday 14/8",
+        "book Friday 14-08",
+        "الجمعة 14-8",
+        "يوم الجمعة 14/8",
+        "عايز الجمعة 14-8",
+    ):
+        key = resolve_date_key(
+            date_hint=None,
+            transcript=text,
+            available=window,
+            today=today,
+            window_days=21,
+        )
+        assert key == target, text
+        assert key != next_fri, text
+
+
+def test_day_month_alone_resolves():
+    today = date(2026, 8, 4)
+    window = {(today + timedelta(days=i)).isoformat() for i in range(21)}
+    key = resolve_date_key(
+        date_hint=None,
+        transcript="احجز يوم 14-8",
+        available=window,
+        today=today,
+        window_days=21,
+    )
+    assert key == "2026-08-14"
+
+
+def test_bare_friday_still_nearest_friday():
+    today = date(2026, 8, 4)
+    window = {(today + timedelta(days=i)).isoformat() for i in range(21)}
+    key = resolve_date_key(
+        date_hint=None,
+        transcript="friday please",
+        available=window,
+        today=today,
+        window_days=21,
+    )
+    assert key == "2026-08-07"
+
+
+def test_normalize_date_hint_accepts_day_month_without_year():
+    today = date(2026, 8, 4)
+    assert _normalize_date_hint("14-8", today=today, window_days=21) == "2026-08-14"
+    assert _normalize_date_hint("14/8/2026", today=today, window_days=21) == "2026-08-14"

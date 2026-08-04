@@ -128,12 +128,14 @@ Relative keywords:
   بعد بكرة / بعد غد / day after tomorrow / after tomorrow -> TODAY + 2 days
   أمبارح / امس      -> TODAY - 1 day (past)
 
-Weekdays (الأحد/الإثنين/الثلاثاء/الأربعاء/الخميس/الجمعة/السبت) -> the NEXT
-occurrence of that weekday from TODAY.
+Weekdays alone (الأحد/الإثنين/…/السبت or Sunday/…) -> the NEXT occurrence
+of that weekday from TODAY.
+If weekday + calendar date together (Friday 14-8, الجمعة 14/8) -> use the
+calendar date as DD-MM (14 August), NOT the nearest Friday/Saturday/etc.
 
-Examples (if TODAY = 2026-07-24, Friday):
-  "بكرة" -> 2026-07-25 ; "يوم الأحد" -> 2026-07-26 ; "الإثنين" -> 2026-07-27 ;
-  "النهاردة" -> 2026-07-24.
+Examples (if TODAY = 2026-08-04, Tuesday):
+  "بكرة" -> 2026-08-05 ; "يوم الأحد" -> 2026-08-09 ; "friday" -> 2026-08-07 ;
+  "Friday 14-8" / "الجمعة 14-8" -> 2026-08-14 (not 2026-08-07).
 OUTPUT FORMAT: always YYYY-MM-DD.
 
 ========================================================================
