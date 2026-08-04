@@ -531,8 +531,8 @@ See [Appendix B](#appendix-b--api-endpoints) for the endpoint list.
 
 ![Deploy path](images/deploy-path.jpg)
 
-**Reliable path:** merge to `main`, then update the Windows server **manually**.  
-GitHub Actions auto-deploy may fail (SSH auth).
+**Auto-deploy:** push/merge to `main` runs `.github/workflows/deploy.yml` over SSH
+(`WINDOWS_SSH_KEY` secret). Manual `git pull` + restart remains a fallback.
 
 ### Local operating commands
 

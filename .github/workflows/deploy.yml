@@ -2,26 +2,57 @@ name: Deploy to Windows server
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
+  workflow_dispatch: # Actions → Deploy → Run workflow
+
+concurrency:
+  group: deploy-windows-main
+  cancel-in-progress: false
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Deploy via SSH
-        uses: appleboy/ssh-action@master
+        uses: appleboy/ssh-action@v1.2.5
         with:
-          host: 196.219.86.38
-          username: Administrator
+          host: ${{ secrets.WINDOWS_SSH_HOST || '196.219.86.38' }}
+          username: ${{ secrets.WINDOWS_SSH_USER || 'Administrator' }}
           key: ${{ secrets.WINDOWS_SSH_KEY }}
-          port: 22
+          port: ${{ secrets.WINDOWS_SSH_PORT || 22 }}
+          script_stop: true
+          command_timeout: 15m
+          # Remote OpenSSH should use PowerShell as DefaultShell (server setup).
           script: |
-            cd C:\apps\hospital-chatbot
-            git pull
-            .\venv\Scripts\pip.exe install -r requirements.txt
-            .\venv\Scripts\python.exe -m alembic upgrade head
-            Restart-Service HospitalChatbotBackend
+            $ErrorActionPreference = 'Stop'
+            Set-Location 'C:\apps\hospital-chatbot'
+
+            Write-Host '==> git sync main'
+            git fetch origin
+            git checkout main
+            git pull origin main
+
+            if (Test-Path '.\venv\Scripts\python.exe') {
+              $py = '.\venv\Scripts\python.exe'
+              $pip = '.\venv\Scripts\pip.exe'
+            } elseif (Test-Path '.\.venv\Scripts\python.exe') {
+              $py = '.\.venv\Scripts\python.exe'
+              $pip = '.\.venv\Scripts\pip.exe'
+            } else {
+              throw 'Python venv not found (expected .\venv or .\.venv)'
+            }
+
+            Write-Host "==> pip install ($pip)"
+            & $pip install -r requirements.txt
+
+            Write-Host '==> alembic upgrade head'
+            & $py -m alembic upgrade head
+
+            Write-Host '==> restart HospitalChatbotBackend'
+            Restart-Service HospitalChatbotBackend -Force
+            Get-Service HospitalChatbotBackend
+
+            Write-Host '==> deploy OK'
+            git rev-parse --short HEAD
