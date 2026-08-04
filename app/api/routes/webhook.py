@@ -271,9 +271,15 @@ def _handle_voice(phone: str, media_id: str | None) -> None:
         # Reply language follows clear speech in the transcript (EN↔AR).
         # Garbage / unclear notes keep the previous reply language.
         lang = LanguageService(db, conversation, sess).apply_voice_language(transcript)
+        plan = result.get("plan")
+        plan_goal = getattr(plan, "goal", None) if plan is not None else None
+        plan_step = getattr(plan, "next_step", None) if plan is not None else None
         _log(
             f"[webhook] voice reply_lang={lang} locked={sess.get('voice_lang_locked')} "
-            f"locked_at={sess.get('voice_lang_locked_at')}"
+            f"locked_at={sess.get('voice_lang_locked_at')} "
+            f"action={action} intent={intent} conf={confidence:.2f} "
+            f"option={option_id!r} goal={plan_goal} step={plan_step} "
+            f"text={transcript!r}"
         )
         db.commit()
 
@@ -282,7 +288,6 @@ def _handle_voice(phone: str, media_id: str | None) -> None:
         # ---- V2: LLM planned the step. Executor runs it. Stop. ----
         # Do NOT fall through into the V1 fastpath maze — that second-guesses
         # the model and is what made voice feel worse.
-        plan = result.get("plan")
         if plan is not None:
             from app.services import voice_executor
 

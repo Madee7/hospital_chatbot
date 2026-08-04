@@ -46,6 +46,9 @@ def is_valid_person_name(name: str | None) -> bool:
     cleaned = normalize_person_name(name)
     if not cleaned:
         return False
+    # Emoji / punctuation-only (👍, . . .) — never a person name.
+    if not any(ch.isalpha() for ch in cleaned):
+        return False
     parts = cleaned.split(" ")
     if len(parts) < 3:
         return False

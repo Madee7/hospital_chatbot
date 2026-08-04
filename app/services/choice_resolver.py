@@ -21,9 +21,94 @@ from app.services.conversation_service import log_openai_chat_usage
 
 Option = dict[str, Any]  # id, title, description?
 
+# Free-text that must NOT collapse onto an open doctor/date/slot list.
+_BOOK_CUES = (
+    "احجز",
+    "حجز",
+    "عايز احجز",
+    "عاوز احجز",
+    "عايزة احجز",
+    "عايزه احجز",
+    "book",
+    "booking",
+    "i want to book",
+    "make an appointment",
+)
+_DAY_CUES = (
+    "بكره",
+    "بكرة",
+    "بكرا",
+    "غدا",
+    "بعد بكره",
+    "بعد بكرة",
+    "بعد غد",
+    "يوم ",
+    "الاثنين",
+    "الاتنين",
+    "الثلاثاء",
+    "التلات",
+    "الاربعاء",
+    "الاربع",
+    "الخميس",
+    "الجمعة",
+    "الجمعه",
+    "السبت",
+    "الاحد",
+    "tomorrow",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+    "after tomorrow",
+    "day after tomorrow",
+)
+_TIME_CUES = (
+    "ساع",
+    "الساع",
+    "الصبح",
+    "المساء",
+    "بليل",
+    " am",
+    " pm",
+    "صباحا",
+    "مساء",
+)
+
 
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+def looks_like_schedule_booking_text(user_text: str) -> bool:
+    """True when the user is asking to book a day/time, not picking a list row."""
+    n = _norm(user_text)
+    if not n:
+        return False
+    # Fold Arabic alef variants for cue matching.
+    for src, dst in (("أ", "ا"), ("إ", "ا"), ("آ", "ا"), ("ة", "ه"), ("ى", "ي")):
+        n = n.replace(src, dst)
+    has_book = any(c in n for c in _BOOK_CUES)
+    has_day = any(c in n for c in _DAY_CUES)
+    has_time = any(c in n for c in _TIME_CUES) or bool(
+        re.search(r"\d{1,2}\s*:\s*\d{2}", n)
+    )
+    return has_book and (has_day or has_time)
+
+
+def _options_look_like_pickers(options: list[Option]) -> bool:
+    """Doctor / date / slot lists — dangerous to fuzzy-map long booking sentences onto."""
+    for opt in options:
+        oid = str(opt.get("id") or "")
+        if oid.startswith(("doctor_", "date_", "slot_", "dept_", "appt_")):
+            return True
+        if _is_time_like_title(str(opt.get("title") or "")):
+            return True
+        if _is_date_like_title(str(opt.get("title") or "")):
+            return True
+    return False
 
 
 def resolve_choice_rules(user_text: str, options: list[Option]) -> str | None:
@@ -255,6 +340,26 @@ def resolve_choice(
     options = options or []
     if not options:
         return None
+
+    # "احجز الدكتور ده يوم الأربعاء" must not become doctor_13 via fuzzy/LLM.
+    skip_fuzzy = looks_like_schedule_booking_text(user_text) and _options_look_like_pickers(
+        options
+    )
+    if skip_fuzzy:
+        # Still allow a pure list index ("1") or exact option title/id.
+        text = (user_text or "").strip()
+        arab_map = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+        digit_text = text.translate(arab_map)
+        if re.fullmatch(r"\d{1,2}", digit_text):
+            return resolve_choice_rules(user_text, options)
+        n = _norm(text)
+        for opt in options:
+            oid = str(opt.get("id") or "")
+            title = str(opt.get("title") or "")
+            if n == _norm(oid) or n == _norm(title):
+                return oid
+        return None
+
     hit = resolve_choice_rules(user_text, options)
     if hit:
         return hit

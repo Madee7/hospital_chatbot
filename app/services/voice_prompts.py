@@ -182,11 +182,11 @@ resolves it against the real doctor list and handles a miss.
 DATE PARSING (always output YYYY-MM-DD)
 ========================================================================
 TODAY is given in the user message; resolve everything relative to it.
-  النهاردة / اليوم    -> TODAY
-  بكرة / غداً         -> TODAY + 1
-  بعد بكرة            -> TODAY + 2
-Weekday names (الأحد/الإثنين/الثلاثاء/الأربعاء/الخميس/الجمعة/السبت) -> the NEXT
-occurrence of that weekday after TODAY.
+  النهاردة / اليوم / today              -> TODAY
+  بكرة / غداً / tomorrow                -> TODAY + 1
+  بعد بكرة / بعد غد / day after tomorrow / after tomorrow -> TODAY + 2
+Weekday names (الأحد/الإثنين/…/السبت or Sunday/Monday/…) -> the NEXT
+occurrence of that weekday on or after TODAY (prefer a day with open slots).
 A day already in the past is not bookable: set date=null, date_flexibility=
 "earliest", and mention it in the summary.
 

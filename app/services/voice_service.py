@@ -124,8 +124,8 @@ All relative dates MUST be calculated from TODAY.
 
 Relative keywords:
   النهاردة / اليوم  -> TODAY
-  بكرة / غداً       -> TODAY + 1 day
-  بعد بكرة          -> TODAY + 2 days
+  بكرة / غداً / tomorrow -> TODAY + 1 day
+  بعد بكرة / بعد غد / day after tomorrow / after tomorrow -> TODAY + 2 days
   أمبارح / امس      -> TODAY - 1 day (past)
 
 Weekdays (الأحد/الإثنين/الثلاثاء/الأربعاء/الخميس/الجمعة/السبت) -> the NEXT

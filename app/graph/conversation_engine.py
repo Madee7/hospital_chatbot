@@ -7,6 +7,7 @@ Doctor cards are sent via WhatsApp Flow ImageCarousel when enabled
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
 from typing import Any, TypedDict
 
@@ -1377,6 +1378,11 @@ def _reshow_booking_slots(phone: str, db: Session, conversation) -> bool:
     return True
 
 
+def _collapse_letter_runs(text: str) -> str:
+    """baaack → back (light typo tolerance for Back)."""
+    return re.sub(r"(.)\1+", r"\1", (text or "").strip(), flags=re.IGNORECASE)
+
+
 def _is_explicit_back_choice(choice: str, text: str) -> bool:
     """True only for real back/return wording, not generic 'no/cancel'."""
     back_tokens = {
@@ -1385,13 +1391,33 @@ def _is_explicit_back_choice(choice: str, text: str) -> bool:
         "إرجع",
         "عودة",
         "العودة",
-        "Back",
         "back",
         "go back",
-        "Return",
         "return",
     }
-    return choice.strip() in back_tokens or text.strip() in back_tokens
+    for raw in (choice, text):
+        s = (raw or "").strip()
+        if not s:
+            continue
+        if s in {"رجوع", "ارجع", "إرجع", "عودة", "العودة", "Back", "back", "Return", "return", "go back"}:
+            return True
+        collapsed = _collapse_letter_runs(s).lower()
+        if collapsed in back_tokens:
+            return True
+    return False
+
+
+def _resolve_spoken_date_key(text: str, dates: list[str]) -> str | None:
+    """Map بكرة / الإثنين / Wednesday onto an available YYYY-MM-DD key."""
+    from app.services.voice_fastpath import resolve_date_key
+
+    if not text or not dates:
+        return None
+    return resolve_date_key(
+        date_hint=None,
+        transcript=text,
+        available=set(dates),
+    )
 
 
 def _handle_explicit_back(
@@ -1595,8 +1621,30 @@ def node_handle(state: GraphState) -> GraphState:
     if not in_lang_select:
         lang_ar_labels.discard("1")
         lang_en_labels.discard("2")
-    explicit_ar = choice in lang_ar_labels or text in lang_ar_labels
-    explicit_en = choice in lang_en_labels or text in lang_en_labels
+    from app.language.language_service import (
+        _is_explicit_arabic_phrase,
+        _is_explicit_english_phrase,
+    )
+
+    explicit_ar = (
+        choice in lang_ar_labels
+        or text in lang_ar_labels
+        or _is_explicit_arabic_phrase(text)
+    )
+    explicit_en = (
+        choice in lang_en_labels
+        or text in lang_en_labels
+        or _is_explicit_english_phrase(text)
+    )
+
+    # Mid-flow explicit switch (e.g. "English please") even when language is set.
+    if conversation.language is not None and not in_lang_select:
+        if explicit_en:
+            lang = lang_svc.set_language("en")
+            db.commit()
+        elif explicit_ar:
+            lang = lang_svc.set_language("ar")
+            db.commit()
 
     if conversation.language is None or in_lang_select:
         sample = text or choice or payload_id
@@ -1890,16 +1938,37 @@ def node_handle(state: GraphState) -> GraphState:
             db.commit()
             return {**state, "handled": True}
 
+        from app.services.choice_resolver import looks_like_schedule_booking_text
+        from app.services.voice_fastpath import find_doctor_by_hint
+
         doctor_id = None
+        schedule_text = looks_like_schedule_booking_text(text)
         if choice.startswith("doctor_"):
             doctor_id = int(choice.replace("doctor_", ""))
         elif sess.get("awaiting") == "doctor":
             for doc in doctor_service.list_active_doctors(db, DEFAULT_CLINIC_ID, limit=50):
                 name_ar = (doc.name_ar or "").strip()
                 name_en = (doc.name_en or "").strip()
-                if (name_ar and name_ar in text) or (name_en and name_en.lower() in text.lower()):
+                if (name_ar and name_ar in text) or (
+                    name_en and name_en.lower() in text.lower()
+                ):
                     doctor_id = doc.doctor_id
                     break
+            if doctor_id is None and schedule_text:
+                hinted = find_doctor_by_hint(db, DEFAULT_CLINIC_ID, text)
+                if hinted:
+                    doctor_id = hinted.doctor_id
+                else:
+                    # "احجز الدكتور ده يوم …" with a single open doctor card.
+                    tnorm = text.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+                    if any(p in tnorm for p in ("الدكتور ده", "الدكتور دا", "this doctor")):
+                        doc_opts = [
+                            o
+                            for o in (sess.get("last_options") or [])
+                            if str(o.get("id") or "").startswith("doctor_")
+                        ]
+                        if len(doc_opts) == 1:
+                            doctor_id = int(str(doc_opts[0]["id"]).replace("doctor_", ""))
 
         if doctor_id:
             lang = _lang(conversation, sess)
@@ -1910,6 +1979,34 @@ def node_handle(state: GraphState) -> GraphState:
             sess.pop("doctor_name_list_offset", None)
             sess.pop("doctor_name_list_next_offset", None)
             continue_after_doctor_selected(db, phone=phone, doctor_id=doctor_id)
+            # Booking sentence with a day → jump to that day's slots when possible.
+            if schedule_text:
+                avail = booking_service.get_available_dates_and_slots(
+                    db, doctor_id=doctor_id, clinic_id=DEFAULT_CLINIC_ID
+                )
+                dates = list(avail.get("dates", {}).keys())
+                selected_date = _resolve_spoken_date_key(text, dates)
+                if selected_date and selected_date in dates:
+                    day_slots = _filter_bookable_slots(
+                        avail.get("dates", {}).get(selected_date) or []
+                    )
+                    if day_slots:
+                        sess["selected_date"] = selected_date
+                        set_conversation_state(
+                            db,
+                            conversation,
+                            ConversationState.BOOKING_SLOT,
+                            current_intent="booking_slot",
+                        )
+                        date_label = _date_option_title(selected_date, lang)
+                        _offer_slots_list(
+                            phone,
+                            day_slots,
+                            lang,
+                            body=i18n.choose_slot_on_date(lang, date_label),
+                            reset=True,
+                        )
+                        db.commit()
             return {**state, "handled": True}
 
         # Already waiting for a doctor pick — don't re-ask specialty vs name.
@@ -1939,7 +2036,7 @@ def node_handle(state: GraphState) -> GraphState:
         elif text in dates:
             selected_date = text
         else:
-            selected_date = None
+            selected_date = _resolve_spoken_date_key(text, dates)
 
         if not selected_date or selected_date not in dates:
             wa.send_text(phone, i18n.choose_day_from_list(lang))
@@ -2361,7 +2458,7 @@ def node_handle(state: GraphState) -> GraphState:
             elif text in dates:
                 selected_date = text
             else:
-                selected_date = None
+                selected_date = _resolve_spoken_date_key(text, dates)
 
             if not selected_date or selected_date not in dates:
                 wa.send_text(phone, i18n.choose_day_from_list(lang))

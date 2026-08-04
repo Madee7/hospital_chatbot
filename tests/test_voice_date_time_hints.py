@@ -126,3 +126,64 @@ def test_d_doctor_only_no_date_key():
         today=_TODAY,
     )
     assert key is None
+
+
+def test_tomorrow_arabic_and_english():
+    for text in ("عايز أحجز بكرة", "غداً الساعة 10", "book tomorrow", "tommorow please"):
+        key = resolve_date_key(
+            date_hint=None,
+            transcript=text,
+            available=_WINDOW,
+            today=_TODAY,
+        )
+        assert key == _WED, text
+
+
+def test_day_after_tomorrow_not_confused_with_tomorrow():
+    """'بعد بكرة' contains 'بكرة' — must resolve to +2, not +1."""
+    after = (_TODAY + timedelta(days=2)).isoformat()  # Thursday 2026-07-23
+    for text in (
+        "عايز أحجز بعد بكرة",
+        "بعد غد",
+        "day after tomorrow",
+        "after tomorrow with Dr Nour",
+    ):
+        key = resolve_date_key(
+            date_hint=None,
+            transcript=text,
+            available=_WINDOW,
+            today=_TODAY,
+        )
+        assert key == after, text
+
+
+def test_bare_monday_picks_next_available_monday():
+    """Bare 'الإثنين' / Monday → next Monday that has openings."""
+    # Today is Tue 21 Jul; next Monday is 27 Jul. Skip a Monday with no slots.
+    monday = "2026-07-27"
+    other = "2026-07-25"  # Saturday
+    avail = {monday, other}
+    for text in ("عايز يوم الإثنين", "الاتنين", "monday please"):
+        key = resolve_date_key(
+            date_hint=None,
+            transcript=text,
+            available=avail,
+            today=_TODAY,
+        )
+        assert key == monday, text
+
+
+def test_bare_monday_skips_unavailable_to_following_week():
+    """If nearest Monday has no slots, use the next Monday in the window."""
+    first_mon = "2026-07-27"
+    second_mon = "2026-08-03"
+    avail = {second_mon, "2026-07-25"}  # first Monday missing
+    key = resolve_date_key(
+        date_hint=None,
+        transcript="الإثنين",
+        available=avail,
+        today=_TODAY,
+        window_days=21,
+    )
+    assert key == second_mon
+    assert key != first_mon

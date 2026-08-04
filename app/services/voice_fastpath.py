@@ -75,13 +75,16 @@ def voice_wants_flow_switch(result: dict[str, Any]) -> bool:
         return True
     return False
 
+# Longer Arabic keys first when matching (الاثنين before اتنين).
 _WEEKDAY_AR = {
     "الاثنين": 0,
     "الاتنين": 0,
+    "يوم الاثنين": 0,
+    "يوم الاتنين": 0,
     "اتنين": 0,
     "الثلاثاء": 1,
-    "التلات": 1,
     "التلاتاء": 1,
+    "التلات": 1,
     "الثلاث": 1,  # Whisper often truncates الثلاثاء
     "الاربعاء": 2,
     "الأربعاء": 2,
@@ -93,6 +96,49 @@ _WEEKDAY_AR = {
     "الاحد": 6,
     "الأحد": 6,
 }
+_WEEKDAY_EN = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+# Day-after MUST be checked before tomorrow — "بعد بكرة" contains "بكرة".
+_RELATIVE_DAY_AFTER = (
+    "بعد بكره",
+    "بعد بكرة",
+    "بعد بكرا",
+    "بعدبكرا",
+    "بعدبكره",
+    "بعدغد",
+    "بعد غد",
+    "بعد الغد",
+    "day after tomorrow",
+    "the day after tomorrow",
+    "after tomorrow",
+)
+_RELATIVE_TOMORROW = (
+    "بكره",
+    "بكرة",
+    "بكرا",
+    "غدا",
+    "غداً",
+    "غداَ",
+    "tomorrow",
+    "tommorow",  # common misspelling / Whisper
+    "tomorow",
+    "bukra",
+    "bokra",
+)
+_RELATIVE_TODAY = (
+    "النهارده",
+    "النهاردة",
+    "النهار دا",
+    "اليوم",
+    "today",
+)
 
 # Eastern/Persian Arabic-Indic digits → ASCII (for time_hint / transcript)
 _AR_DIGIT_TRANS = str.maketrans(
@@ -426,6 +472,24 @@ def _normalize_time_hint(
     return f"{hour:02d}:{minute:02d}"
 
 
+def _next_weekday_iso(
+    today: date,
+    weekday: int,
+    *,
+    available: set[str] | None,
+    window_days: int,
+) -> str | None:
+    """Next occurrence of weekday (incl. today) that is bookable / has slots."""
+    for i in range(0, window_days):
+        cand = today + timedelta(days=i)
+        if cand.weekday() != weekday:
+            continue
+        iso = cand.isoformat()
+        if available is None or iso in available:
+            return iso
+    return None
+
+
 def resolve_date_key(
     *,
     date_hint: str | None = None,
@@ -444,24 +508,38 @@ def resolve_date_key(
 
     candidates: list[str] = []
 
-    if any(w in blob for w in ("النهارده", "النهاردة", "اليوم", "today")):
-        candidates.append(today.isoformat())
-    if any(w in blob for w in ("بكره", "بكرة", "غدا", "غداً", "غداَ", "tomorrow")):
-        candidates.append((today + timedelta(days=1)).isoformat())
-    if any(w in blob for w in ("بعد بكره", "بعد بكرة", "بعدغد", "بعد غد")):
+    # Relative phrases (day-after before tomorrow — substring overlap).
+    if any(w in blob for w in _RELATIVE_DAY_AFTER):
         candidates.append((today + timedelta(days=2)).isoformat())
+    elif any(w in blob for w in _RELATIVE_TOMORROW):
+        candidates.append((today + timedelta(days=1)).isoformat())
+    elif any(w in blob for w in _RELATIVE_TODAY):
+        candidates.append(today.isoformat())
 
-    # Weekdays from speech first (more reliable than GPT calendar math)
-    for name, wd in _WEEKDAY_AR.items():
-        if _norm_ar(name) in blob:
-            for i in range(0, window_days):
-                cand = today + timedelta(days=i)
-                if cand.weekday() != wd:
-                    continue
-                iso = cand.isoformat()
-                if available is None or iso in available:
-                    candidates.append(iso)
-                    break
+    # Weekdays from speech (longer Arabic names first; EN monday/…).
+    # Prefer the next weekday that actually has openings when `available` is set.
+    weekday_matched = False
+    ar_names = sorted(_WEEKDAY_AR.items(), key=lambda kv: len(_norm_ar(kv[0])), reverse=True)
+    for name, wd in ar_names:
+        if _norm_ar(name) not in blob:
+            continue
+        iso = _next_weekday_iso(
+            today, wd, available=available, window_days=window_days
+        )
+        if iso:
+            candidates.append(iso)
+        weekday_matched = True
+        break
+    if not weekday_matched:
+        for name, wd in _WEEKDAY_EN.items():
+            if name not in blob:
+                continue
+            iso = _next_weekday_iso(
+                today, wd, available=available, window_days=window_days
+            )
+            if iso:
+                candidates.append(iso)
+            break
 
     # GPT / explicit ISO only if inside booking window (drops 2023 hallucinations)
     normalized = _normalize_date_hint(

@@ -6,6 +6,7 @@ Detects language from every inbound user message, persists it on
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any, Literal
 
@@ -25,6 +26,39 @@ from app.models.conversation_models import Conversation
 from app.services.conversation_service import set_conversation_language
 
 LangCode = Literal["ar", "en"]
+
+
+def _is_explicit_english_phrase(text: str) -> bool:
+    """True for short switch requests like 'English please' / 'speak english'."""
+    t = (text or "").strip().lower()
+    if not t or len(t) > 48:
+        return False
+    if re.fullmatch(
+        r"(please\s+)?(speak\s+|switch\s+to\s+|use\s+)?english(\s+please)?[!?.]*",
+        t,
+    ):
+        return True
+    return any(
+        p in t
+        for p in (
+            "بالانجليزي",
+            "بالإنجليزي",
+            "انجليزي من فضلك",
+            "إنجليزي من فضلك",
+        )
+    )
+
+
+def _is_explicit_arabic_phrase(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t or len(t) > 48:
+        return False
+    if re.fullmatch(
+        r"(please\s+)?(speak\s+|switch\s+to\s+|use\s+)?arabic(\s+please)?[!?.]*",
+        t,
+    ):
+        return True
+    return any(p in t for p in ("بالعربي", "عربي من فضلك", "العربية من فضلك"))
 
 
 def get_conversation_language(
@@ -150,6 +184,10 @@ class LanguageService:
             return self.set_language("ar")
         if payload == "lang_en" or sample_text in explicit_en:
             return self.set_language("en")
+        if _is_explicit_english_phrase(sample_text):
+            return self.set_language("en")
+        if _is_explicit_arabic_phrase(sample_text):
+            return self.set_language("ar")
 
         # Interactive list/button choice: ignore the echoed title completely.
         if is_ui_payload(payload):
