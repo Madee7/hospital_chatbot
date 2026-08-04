@@ -22,9 +22,11 @@ jobs:
           username: ${{ secrets.WINDOWS_SSH_USER || 'Administrator' }}
           key: ${{ secrets.WINDOWS_SSH_KEY }}
           port: ${{ secrets.WINDOWS_SSH_PORT || 22 }}
-          script_stop: true
           command_timeout: 15m
-          # Remote OpenSSH should use PowerShell as DefaultShell (server setup).
+          request_pty: true
+          debug: true
+          # Remote OpenSSH DefaultShell should be PowerShell.
+          # $ErrorActionPreference stops on first failure (script_stop was removed in ssh-action v1.2+).
           script: |
             $ErrorActionPreference = 'Stop'
             Set-Location 'C:\apps\hospital-chatbot'
