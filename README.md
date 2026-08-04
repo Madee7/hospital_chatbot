@@ -71,43 +71,14 @@ Run from the repo root. `DATABASE_URL` comes from `.env` / `app.core.config`, no
 
 ## Documentation
 
-Full project guide (architecture, flows, deploy, WhatsApp Flow setup):
-
-- [`docs/DOCUMENTATION.md`](docs/DOCUMENTATION.md)
+- Full project guide: [`docs/DOCUMENTATION.md`](docs/DOCUMENTATION.md)
+- **Deploy guide (what was set up, SSH, secrets, Streamlit):** [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)
 - PDF export: [`docs/pdf/DOCUMENTATION.pdf`](docs/pdf/DOCUMENTATION.pdf)
 
 ## Deploy
 
-Push / merge to `main` triggers GitHub Actions → SSH deploy
-(`.github/workflows/deploy.yml`):
-
-1. `git pull origin main` on `C:\apps\hospital-chatbot`
-2. `pip install -r requirements.txt`
-3. `alembic upgrade head`
-4. `Restart-Service HospitalChatbotBackend`
-
-**Secrets** (repo → Settings → Secrets → Actions):
-
-| Secret | Required | Notes |
-|--------|----------|--------|
-| `WINDOWS_SSH_KEY` | yes | Private key for the server |
-| `WINDOWS_SSH_HOST` | optional | Defaults to server IP in the workflow |
-| `WINDOWS_SSH_USER` | optional | Defaults to `Administrator` |
-| `WINDOWS_SSH_PORT` | optional | Defaults to `22` |
-
-Manual run: Actions → **Deploy to Windows server** → **Run workflow**.
-
-If Actions fails, update the server manually:
-
-```powershell
-cd C:\apps\hospital-chatbot
-git checkout main
-git pull origin main
-.\venv\Scripts\pip.exe install -r requirements.txt
-.\venv\Scripts\python.exe -m alembic upgrade head
-Restart-Service HospitalChatbotBackend
-```
-
+Push / merge to `main` → GitHub Actions SSH deploy (backend auto-restarts).  
+Full details: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 ## Project Structure (High Level)
 
 - `app/api` — HTTP routes / webhook

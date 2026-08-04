@@ -534,6 +534,11 @@ See [Appendix B](#appendix-b--api-endpoints) for the endpoint list.
 **Auto-deploy:** push/merge to `main` runs `.github/workflows/deploy.yml` over SSH
 (`WINDOWS_SSH_KEY` secret). Manual `git pull` + restart remains a fallback.
 
+**Full deploy write-up** (what was configured, Windows `administrators_authorized_keys`,
+secrets, Streamlit caveat, troubleshooting, key rotation):
+
+→ [`docs/DEPLOYMENT.md`](DEPLOYMENT.md)
+
 ### Local operating commands
 
 ```powershell
@@ -759,7 +764,7 @@ When you update this guide later, append one line above with the date and a shor
 | Tool / Technology | Category | Purpose | Where It Is Used |
 |:------------------|:---------|:--------|:-----------------|
 | Git / GitHub | Source control | Versioning, PRs, Actions | Repository + CI workflow |
-| GitHub Actions | CI/CD | Deploy workflow to Windows server | `.github/workflows` (SSH may fail) |
+| GitHub Actions | CI/CD | SSH deploy to Windows on `main` | `.github/workflows/deploy.yml` — see [`DEPLOYMENT.md`](DEPLOYMENT.md) |
 | pytest / `tests/` | Automated testing | Voice and specialty unit tests | `tests/` |
 | Alembic CLI | Schema ops | `upgrade` / `stamp` / revisions | Deploy and local |
 | Swagger UI (`/docs`) | API exploration | Interactive API docs | Running FastAPI app |
