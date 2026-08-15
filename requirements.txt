@@ -50,3 +50,4 @@ Pillow>=10.0.0
 streamlit>=1.32.0
 pandas>=2.0.0
 lingua-language-detector>=2.0.2
+bcrypt>=4.0.0

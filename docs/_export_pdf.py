@@ -45,12 +45,23 @@ h3 {
   margin-top: 12px;
   page-break-after: avoid;
 }
+h4 {
+  color: #0f766e;
+  font-size: 10.5pt;
+  margin-top: 10px;
+  page-break-after: avoid;
+}
 blockquote {
   background: #ecfdf5;
   border-left: 4px solid #0f766e;
   margin: 8px 0;
   padding: 6px 10px;
   color: #134e4a;
+}
+blockquote strong {
+  display: block;
+  letter-spacing: 0.03em;
+  font-size: 11pt;
 }
 code {
   background: #f3f4f6;
@@ -88,7 +99,20 @@ td {
   vertical-align: top;
 }
 tr:nth-child(even) td { background: #f8fafc; }
-img { max-width: 100%; height: auto; margin: 8px 0; }
+img {
+  max-width: 100%;
+  height: auto;
+  margin: 10px 0 4px 0;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  page-break-inside: avoid;
+}
+em {
+  display: block;
+  font-size: 9pt;
+  color: #475569;
+  margin: 0 0 12px 0;
+}
 hr { border: none; border-top: 1px solid #99f6e4; margin: 12px 0; }
 ul, ol { margin: 4px 0 4px 16px; }
 """

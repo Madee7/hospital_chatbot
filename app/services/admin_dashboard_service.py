@@ -9,8 +9,16 @@ from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session
 
 from app.core import i18n_bot as i18n
-from app.db.enums import AppointmentStatus, ConversationState, ReminderStatus
-from app.models.admin_models import AdminUser, ConfigSetting
+from app.core.security import hash_password, verify_password
+from app.db.enums import AppointmentStatus, ConversationState, Language, ReminderStatus
+from app.models.admin_models import (
+    ROLE_CLINIC_ADMIN,
+    ROLE_COMPANY_ADMIN,
+    ADMIN_ROLES,
+    AdminUser,
+    AdminUserClinic,
+    ConfigSetting,
+)
 from app.models.appointment_models import Appointment, AppointmentHistory, AppointmentSlot
 from app.models.conversation_models import Conversation, Message, VoiceMessage
 from app.models.core_models import Clinic, Department
@@ -60,8 +68,11 @@ def weekday_label(weekday: int, lang: str = "en") -> str:
     return str(weekday)
 
 
-def list_clinics(db: Session) -> list[dict]:
-    rows = db.query(Clinic).order_by(Clinic.clinic_id.asc()).all()
+def list_clinics(db: Session, *, tenant_id: int | None = None) -> list[dict]:
+    q = db.query(Clinic)
+    if tenant_id is not None:
+        q = q.filter(Clinic.tenant_id == tenant_id)
+    rows = q.order_by(Clinic.clinic_id.asc()).all()
     return [
         {
             "clinic_id": c.clinic_id,
@@ -79,6 +90,250 @@ def list_clinics(db: Session) -> list[dict]:
         }
         for c in rows
     ]
+
+
+def create_clinic(
+    db: Session,
+    *,
+    tenant_id: int,
+    clinic_name: str,
+    whatsapp_number: str | None = None,
+    timezone: str = "Africa/Cairo",
+    language_default: str = "ar-EG",
+    address: str | None = None,
+    status: str = "active",
+    created_by: str = "dashboard",
+) -> Clinic:
+    name = (clinic_name or "").strip()
+    if not name:
+        raise ValueError("Clinic name is required")
+    lang = language_default or "ar-EG"
+    try:
+        lang_enum = Language(lang)
+    except ValueError:
+        lang_enum = Language.AR_EG
+    clinic = Clinic(
+        tenant_id=tenant_id,
+        clinic_name=name,
+        whatsapp_number=(whatsapp_number or "").strip() or None,
+        timezone=(timezone or "Africa/Cairo").strip() or "Africa/Cairo",
+        language_default=lang_enum,
+        address=(address or "").strip() or None,
+        status=(status or "active").strip() or "active",
+        created_by=created_by,
+        updated_by=created_by,
+    )
+    db.add(clinic)
+    db.commit()
+    db.refresh(clinic)
+    return clinic
+
+
+def _normalize_role(role: str | None) -> str:
+    r = (role or "").strip().lower()
+    if r in {"admin", "company", "company_admin", "super_admin"}:
+        return ROLE_COMPANY_ADMIN
+    if r in {"clinic", "clinic_admin", "staff"}:
+        return ROLE_CLINIC_ADMIN
+    if r in ADMIN_ROLES:
+        return r
+    return ROLE_CLINIC_ADMIN
+
+
+def _user_dict(user: AdminUser) -> dict[str, Any]:
+    return {
+        "user_id": user.user_id,
+        "email": user.email,
+        "role": _normalize_role(user.role),
+        "tenant_id": user.tenant_id,
+        "active_flag": bool(user.active_flag),
+    }
+
+
+def list_clinics_for_user(db: Session, user: dict[str, Any]) -> list[dict]:
+    """Clinics the logged-in user may open."""
+    role = _normalize_role(str(user.get("role") or ""))
+    tenant_id = int(user.get("tenant_id") or 0)
+    if role == ROLE_COMPANY_ADMIN:
+        return list_clinics(db, tenant_id=tenant_id or None)
+    user_id = int(user.get("user_id") or 0)
+    if not user_id:
+        return []
+    rows = (
+        db.query(Clinic)
+        .join(AdminUserClinic, AdminUserClinic.clinic_id == Clinic.clinic_id)
+        .filter(AdminUserClinic.user_id == user_id)
+        .order_by(Clinic.clinic_id.asc())
+        .all()
+    )
+    return [
+        {
+            "clinic_id": c.clinic_id,
+            "tenant_id": c.tenant_id,
+            "clinic_name": c.clinic_name,
+            "whatsapp_number": c.whatsapp_number,
+            "timezone": c.timezone,
+            "language_default": (
+                c.language_default.value
+                if c.language_default and hasattr(c.language_default, "value")
+                else c.language_default
+            ),
+            "address": c.address,
+            "status": c.status,
+        }
+        for c in rows
+    ]
+
+
+def user_can_access_clinic(db: Session, user: dict[str, Any], clinic_id: int) -> bool:
+    role = _normalize_role(str(user.get("role") or ""))
+    tenant_id = int(user.get("tenant_id") or 0)
+    clinic = get_clinic(db, clinic_id)
+    if not clinic:
+        return False
+    if role == ROLE_COMPANY_ADMIN:
+        return clinic.tenant_id == tenant_id or tenant_id == 0
+    allowed = {c["clinic_id"] for c in list_clinics_for_user(db, user)}
+    return clinic_id in allowed
+
+
+def list_admin_users(db: Session, *, tenant_id: int) -> list[dict]:
+    rows = (
+        db.query(AdminUser)
+        .filter(AdminUser.tenant_id == tenant_id)
+        .order_by(AdminUser.user_id.asc())
+        .all()
+    )
+    out: list[dict] = []
+    for u in rows:
+        clinic_ids = [
+            link.clinic_id
+            for link in (
+                db.query(AdminUserClinic)
+                .filter(AdminUserClinic.user_id == u.user_id)
+                .order_by(AdminUserClinic.clinic_id.asc())
+                .all()
+            )
+        ]
+        item = _user_dict(u)
+        item["clinic_ids"] = clinic_ids
+        out.append(item)
+    return out
+
+
+def set_user_clinics(
+    db: Session,
+    *,
+    user_id: int,
+    clinic_ids: list[int],
+    tenant_id: int,
+) -> None:
+    user = (
+        db.query(AdminUser)
+        .filter(AdminUser.user_id == user_id, AdminUser.tenant_id == tenant_id)
+        .one_or_none()
+    )
+    if not user:
+        raise ValueError("User not found")
+    # Only clinics in the same tenant
+    valid_ids = {
+        c.clinic_id
+        for c in db.query(Clinic).filter(Clinic.tenant_id == tenant_id).all()
+    }
+    wanted = sorted({int(x) for x in clinic_ids if int(x) in valid_ids})
+    db.query(AdminUserClinic).filter(AdminUserClinic.user_id == user_id).delete()
+    for cid in wanted:
+        db.add(AdminUserClinic(user_id=user_id, clinic_id=cid))
+    db.commit()
+
+
+def create_admin_user(
+    db: Session,
+    *,
+    tenant_id: int,
+    email: str,
+    password: str,
+    role: str,
+    clinic_ids: list[int] | None = None,
+    created_by: str = "dashboard",
+) -> AdminUser:
+    addr = (email or "").strip().lower()
+    if not addr or "@" not in addr:
+        raise ValueError("Valid email is required")
+    if not (password or "").strip():
+        raise ValueError("Password is required")
+    normalized = _normalize_role(role)
+    existing = (
+        db.query(AdminUser)
+        .filter(AdminUser.tenant_id == tenant_id, AdminUser.email == addr)
+        .one_or_none()
+    )
+    if existing:
+        raise ValueError("Email already exists for this tenant")
+    user = AdminUser(
+        tenant_id=tenant_id,
+        email=addr,
+        role=normalized,
+        password_hash=hash_password(password.strip()),
+        active_flag=True,
+        created_by=created_by,
+        updated_by=created_by,
+    )
+    db.add(user)
+    db.flush()
+    if normalized == ROLE_CLINIC_ADMIN:
+        set_user_clinics(
+            db,
+            user_id=user.user_id,
+            clinic_ids=list(clinic_ids or []),
+            tenant_id=tenant_id,
+        )
+    else:
+        db.commit()
+        db.refresh(user)
+    return user
+
+
+def set_admin_password(
+    db: Session,
+    *,
+    user_id: int,
+    tenant_id: int,
+    password: str,
+    updated_by: str = "dashboard",
+) -> None:
+    if not (password or "").strip():
+        raise ValueError("Password is required")
+    user = (
+        db.query(AdminUser)
+        .filter(AdminUser.user_id == user_id, AdminUser.tenant_id == tenant_id)
+        .one_or_none()
+    )
+    if not user:
+        raise ValueError("User not found")
+    user.password_hash = hash_password(password.strip())
+    user.updated_by = updated_by
+    db.commit()
+
+
+def set_admin_active(
+    db: Session,
+    *,
+    user_id: int,
+    tenant_id: int,
+    active: bool,
+    updated_by: str = "dashboard",
+) -> None:
+    user = (
+        db.query(AdminUser)
+        .filter(AdminUser.user_id == user_id, AdminUser.tenant_id == tenant_id)
+        .one_or_none()
+    )
+    if not user:
+        raise ValueError("User not found")
+    user.active_flag = bool(active)
+    user.updated_by = updated_by
+    db.commit()
 
 
 def get_clinic(db: Session, clinic_id: int) -> Clinic | None:
@@ -677,31 +932,34 @@ def set_config(
     db.commit()
 
 
-def authenticate_admin(db: Session, email: str, password: str, expected_password: str) -> dict | None:
-    """Demo login: email must exist as AdminUser (or any email) + shared env password."""
-    if not expected_password or password != expected_password:
+def authenticate_admin(
+    db: Session,
+    email: str,
+    password: str,
+    expected_password: str | None = None,
+) -> dict | None:
+    """Authenticate by email + bcrypt hash. No shared-env / any-email fallback.
+
+    ``expected_password`` is ignored (kept for call-site compatibility).
+    """
+    _ = expected_password
+    addr = (email or "").strip().lower()
+    if not addr or not (password or ""):
         return None
     user = (
         db.query(AdminUser)
-        .filter(AdminUser.email == email, AdminUser.active_flag == True)  # noqa: E712
+        .filter(AdminUser.email == addr, AdminUser.active_flag == True)  # noqa: E712
         .one_or_none()
     )
-    if user:
-        user.last_login = datetime.utcnow()
-        db.commit()
-        return {
-            "user_id": user.user_id,
-            "email": user.email,
-            "role": user.role,
-            "tenant_id": user.tenant_id,
-        }
-    # Fallback demo admin when no AdminUser seed exists
-    return {
-        "user_id": 0,
-        "email": email or "admin@demo.local",
-        "role": "admin",
-        "tenant_id": 1,
-    }
+    if not user or not verify_password(password, user.password_hash):
+        return None
+    # Normalize legacy roles on successful login
+    normalized = _normalize_role(user.role)
+    if user.role != normalized:
+        user.role = normalized
+    user.last_login = datetime.utcnow()
+    db.commit()
+    return _user_dict(user)
 
 
 def compute_kpis(db: Session, *, clinic_id: int, days: int = 30) -> dict[str, Any]:

@@ -4,15 +4,14 @@ Hospital Admin Dashboard (Streamlit).
 Run from repo root:
   streamlit run dashboard/streamlit_app.py
 
-Optional .env:
-  ADMIN_DASHBOARD_PASSWORD=changeme
+Login uses AdminUser email + password_hash in PostgreSQL.
+Seed / migrate may set the initial hash from ADMIN_DASHBOARD_PASSWORD.
 """
 
 from __future__ import annotations
 
 import csv
 import io
-import os
 import sys
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -29,8 +28,9 @@ load_dotenv(ROOT / ".env")
 
 import importlib
 
-from app.core.config import CLINIC_DISPLAY_NAME, DEFAULT_CLINIC_ID, DEFAULT_TENANT_ID
+from app.core.config import CLINIC_DISPLAY_NAME, DEFAULT_TENANT_ID
 from app.db.database import SessionLocal
+from app.models.admin_models import ROLE_COMPANY_ADMIN
 from app.services import admin_dashboard_service as admin
 from app.services import dashboard_service as dash
 from app.services import handover_service
@@ -49,7 +49,8 @@ def _ui(key: str, **kwargs) -> str:
     return _tr(key, st.session_state.get("ui_lang", "en"), **kwargs)
 
 
-ADMIN_PASSWORD = os.getenv("ADMIN_DASHBOARD_PASSWORD", "admin123")
+def _is_company_admin(user: dict | None) -> bool:
+    return bool(user) and str(user.get("role") or "") == ROLE_COMPANY_ADMIN
 
 
 def _form_nonce(prefix: str) -> int:
@@ -199,20 +200,149 @@ def require_login() -> bool:
     if st.session_state.get("auth"):
         return True
     st.title(_ui("login_title"))
-    email = st.text_input(_ui("email"), value="admin@clinic.local")
+    email = st.text_input(_ui("email"), value="")
     password = st.text_input(_ui("password"), type="password")
     if st.button(_ui("login"), type="primary"):
         db = _db()
         try:
-            user = admin.authenticate_admin(db, email=email, password=password, expected_password=ADMIN_PASSWORD)
+            user = admin.authenticate_admin(db, email=email, password=password)
         finally:
             db.close()
         if not user:
-            st.error("Invalid credentials.")
+            st.error(_ui("login_failed"))
             return False
         st.session_state["auth"] = user
         st.rerun()
     return False
+
+
+def page_users(db, user: dict) -> None:
+    st.subheader(_ui("users"))
+    tenant_id = int(user.get("tenant_id") or DEFAULT_TENANT_ID)
+    rows = admin.list_admin_users(db, tenant_id=tenant_id)
+    st.dataframe(_df(rows), use_container_width=True, hide_index=True)
+
+    clinics = admin.list_clinics(db, tenant_id=tenant_id)
+    clinic_labels = {
+        f"{c['clinic_name'] or 'Clinic'} (#{c['clinic_id']})": c["clinic_id"] for c in clinics
+    }
+
+    st.markdown(f"**{_ui('create_user')}**")
+    with st.form("create_admin_user_form"):
+        email = st.text_input(_ui("email"))
+        password = st.text_input(_ui("password"), type="password")
+        role = st.selectbox(
+            _ui("role"),
+            options=["company_admin", "clinic_admin"],
+            format_func=lambda r: _ui("role_company") if r == "company_admin" else _ui("role_clinic"),
+        )
+        assigned = st.multiselect(
+            _ui("assign_clinics"),
+            options=list(clinic_labels.keys()),
+            disabled=(role == "company_admin"),
+        )
+        if st.form_submit_button(_ui("create_user"), type="primary"):
+            try:
+                admin.create_admin_user(
+                    db,
+                    tenant_id=tenant_id,
+                    email=email,
+                    password=password,
+                    role=role,
+                    clinic_ids=[clinic_labels[x] for x in assigned],
+                    created_by=str(user.get("email") or "dashboard"),
+                )
+                st.success(_ui("user_created"))
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+
+    if not rows:
+        return
+
+    st.markdown(f"**{_ui('manage_user')}**")
+    pick_labels = {
+        f"{r['email']} (#{r['user_id']}) · {r['role']}": r for r in rows
+    }
+    pick = st.selectbox(_ui("select_user"), options=list(pick_labels.keys()))
+    selected = pick_labels[pick]
+    col1, col2 = st.columns(2)
+    with col1:
+        new_pw = st.text_input(_ui("new_password"), type="password", key="reset_pw")
+        if st.button(_ui("reset_password")):
+            try:
+                admin.set_admin_password(
+                    db,
+                    user_id=int(selected["user_id"]),
+                    tenant_id=tenant_id,
+                    password=new_pw,
+                    updated_by=str(user.get("email") or "dashboard"),
+                )
+                st.success(_ui("password_updated"))
+            except ValueError as exc:
+                st.error(str(exc))
+    with col2:
+        active = st.checkbox(_ui("active"), value=bool(selected.get("active_flag")), key="user_active")
+        if st.button(_ui("save_active")):
+            admin.set_admin_active(
+                db,
+                user_id=int(selected["user_id"]),
+                tenant_id=tenant_id,
+                active=active,
+                updated_by=str(user.get("email") or "dashboard"),
+            )
+            st.success(_ui("user_updated"))
+            st.rerun()
+
+    if selected.get("role") == "clinic_admin":
+        current = set(int(x) for x in (selected.get("clinic_ids") or []))
+        default_labels = [k for k, v in clinic_labels.items() if v in current]
+        new_assign = st.multiselect(
+            _ui("assign_clinics"),
+            options=list(clinic_labels.keys()),
+            default=default_labels,
+            key="edit_user_clinics",
+        )
+        if st.button(_ui("save_clinics")):
+            admin.set_user_clinics(
+                db,
+                user_id=int(selected["user_id"]),
+                clinic_ids=[clinic_labels[x] for x in new_assign],
+                tenant_id=tenant_id,
+            )
+            st.success(_ui("user_updated"))
+            st.rerun()
+
+
+def page_clinics_mgmt(db, user: dict) -> None:
+    st.subheader(_ui("clinics"))
+    tenant_id = int(user.get("tenant_id") or DEFAULT_TENANT_ID)
+    rows = admin.list_clinics(db, tenant_id=tenant_id)
+    st.dataframe(_df(rows), use_container_width=True, hide_index=True)
+
+    st.markdown(f"**{_ui('create_clinic')}**")
+    with st.form("create_clinic_form"):
+        name = st.text_input(_ui("clinic_name"))
+        whatsapp = st.text_input(_ui("whatsapp"))
+        tz = st.text_input(_ui("timezone"), value="Africa/Cairo")
+        lang = st.selectbox(_ui("default_language"), options=["ar-EG", "ar", "en"], index=0)
+        address = st.text_area(_ui("address"))
+        if st.form_submit_button(_ui("create_clinic"), type="primary"):
+            try:
+                clinic = admin.create_clinic(
+                    db,
+                    tenant_id=tenant_id,
+                    clinic_name=name,
+                    whatsapp_number=whatsapp,
+                    timezone=tz,
+                    language_default=lang,
+                    address=address,
+                    created_by=str(user.get("email") or "dashboard"),
+                )
+                st.success(_ui("clinic_created", id=clinic.clinic_id))
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
 
 
 def page_kpis(db, clinic_id: int) -> None:
@@ -994,18 +1124,24 @@ def main() -> None:
     clinics = []
     db = _db()
     try:
-        clinics = admin.list_clinics(db)
+        clinics = admin.list_clinics_for_user(db, user)
     finally:
         db.close()
 
-    clinic_options = {f"{c['clinic_name'] or 'Clinic'} (#{c['clinic_id']})": c["clinic_id"] for c in clinics}
+    clinic_options = {
+        f"{c['clinic_name'] or 'Clinic'} (#{c['clinic_id']})": c["clinic_id"] for c in clinics
+    }
     if not clinic_options:
-        clinic_options = {f"Clinic #{DEFAULT_CLINIC_ID}": DEFAULT_CLINIC_ID}
+        st.error(_ui("no_clinics_access"))
+        return
 
     clinic_label = st.sidebar.selectbox(_ui("clinic"), options=list(clinic_options.keys()))
     clinic_id = clinic_options[clinic_label]
 
+    company = _is_company_admin(user)
     screen_keys = [k for k, _ in SCREENS]
+    if not company:
+        screen_keys = [k for k in screen_keys if k not in {"users", "clinics"}]
     page_key = st.sidebar.radio(
         _ui("screen"),
         options=screen_keys,
@@ -1019,6 +1155,9 @@ def main() -> None:
 
     db = _db()
     try:
+        if not admin.user_can_access_clinic(db, user, clinic_id):
+            st.error(_ui("clinic_access_denied"))
+            return
         if page_key == "kpis":
             page_kpis(db, clinic_id)
         elif page_key == "clinic_setup":
@@ -1041,6 +1180,12 @@ def main() -> None:
             page_settings(db, clinic_id)
         elif page_key == "usage":
             page_usage(db, clinic_id)
+        elif page_key == "users" and company:
+            page_users(db, user)
+        elif page_key == "clinics" and company:
+            page_clinics_mgmt(db, user)
+        else:
+            st.error(_ui("clinic_access_denied"))
     finally:
         db.close()
 

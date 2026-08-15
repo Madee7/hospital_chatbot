@@ -22,7 +22,7 @@ from app.models.conversation_models import Conversation, Message, VoiceMessage
 from app.models.reminder_models import Reminder
 from app.models.handover_models import HandoverCase
 from app.models.usage_models import UsageLog
-from app.models.admin_models import AdminUser, ConfigSetting
+from app.models.admin_models import AdminUser, AdminUserClinic, ConfigSetting
 
 __all__ = [
     "Tenant",
@@ -44,5 +44,6 @@ __all__ = [
     "HandoverCase",
     "UsageLog",
     "AdminUser",
+    "AdminUserClinic",
     "ConfigSetting",
 ]

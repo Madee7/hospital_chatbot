@@ -10,13 +10,21 @@ Usage:
 
 from __future__ import annotations
 
+import os
 from datetime import time
 
 from sqlalchemy import text
 
+from app.core.security import hash_password
 from app.db.database import SessionLocal, create_tables, engine
 from app.db.enums import Language
-from app.models.admin_models import AdminUser, ConfigSetting
+from app.models.admin_models import (
+    ROLE_CLINIC_ADMIN,
+    ROLE_COMPANY_ADMIN,
+    AdminUser,
+    AdminUserClinic,
+    ConfigSetting,
+)
 from app.models.core_models import Clinic, Department, Tenant
 from app.models.doctor_models import Doctor, DoctorWorkingHours
 
@@ -429,17 +437,81 @@ def seed() -> None:
         dept_ids = _seed_departments(db, clinic.clinic_id)
         _seed_doctors(db, tenant.tenant_id, clinic.clinic_id, dept_ids)
 
-        if not db.query(AdminUser).filter(AdminUser.email == "admin@demo.local").one_or_none():
+        bootstrap_pw = (
+            os.getenv("ADMIN_DASHBOARD_PASSWORD")
+            or os.getenv("ADMIN_BOOTSTRAP_PASSWORD")
+            or "admin123"
+        )
+        pw_hash = hash_password(bootstrap_pw)
+
+        company = (
+            db.query(AdminUser)
+            .filter(AdminUser.email == "admin@demo.local")
+            .one_or_none()
+        )
+        if not company:
+            company = AdminUser(
+                tenant_id=tenant.tenant_id,
+                email="admin@demo.local",
+                role=ROLE_COMPANY_ADMIN,
+                password_hash=pw_hash,
+                active_flag=True,
+                created_by="seed",
+                updated_by="seed",
+            )
+            db.add(company)
+            db.flush()
+        else:
+            company.role = ROLE_COMPANY_ADMIN
+            if not company.password_hash:
+                company.password_hash = pw_hash
+            company.active_flag = True
+            company.updated_by = "seed"
+
+        clinic_admin = (
+            db.query(AdminUser)
+            .filter(AdminUser.email == "clinic@demo.local")
+            .one_or_none()
+        )
+        if not clinic_admin:
+            clinic_admin = AdminUser(
+                tenant_id=tenant.tenant_id,
+                email="clinic@demo.local",
+                role=ROLE_CLINIC_ADMIN,
+                password_hash=pw_hash,
+                active_flag=True,
+                created_by="seed",
+                updated_by="seed",
+            )
+            db.add(clinic_admin)
+            db.flush()
             db.add(
-                AdminUser(
-                    tenant_id=tenant.tenant_id,
-                    email="admin@demo.local",
-                    role="admin",
-                    active_flag=True,
-                    created_by="seed",
-                    updated_by="seed",
+                AdminUserClinic(
+                    user_id=clinic_admin.user_id,
+                    clinic_id=clinic.clinic_id,
                 )
             )
+        else:
+            clinic_admin.role = ROLE_CLINIC_ADMIN
+            if not clinic_admin.password_hash:
+                clinic_admin.password_hash = pw_hash
+            clinic_admin.active_flag = True
+            clinic_admin.updated_by = "seed"
+            has_link = (
+                db.query(AdminUserClinic)
+                .filter(
+                    AdminUserClinic.user_id == clinic_admin.user_id,
+                    AdminUserClinic.clinic_id == clinic.clinic_id,
+                )
+                .one_or_none()
+            )
+            if not has_link:
+                db.add(
+                    AdminUserClinic(
+                        user_id=clinic_admin.user_id,
+                        clinic_id=clinic.clinic_id,
+                    )
+                )
 
         if not (
             db.query(ConfigSetting)

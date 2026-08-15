@@ -71,9 +71,15 @@ Run from the repo root. `DATABASE_URL` comes from `.env` / `app.core.config`, no
 
 ## Documentation
 
-- Full project guide: [`docs/DOCUMENTATION.md`](docs/DOCUMENTATION.md)
-- **Deploy guide (what was set up, SSH, secrets, Streamlit):** [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)
+- **Full technical & architecture guide (v4):** [`docs/DOCUMENTATION.md`](docs/DOCUMENTATION.md) — product → architecture → ops → reference; figures + GUI screenshots
+- **Deploy guide (SSH, secrets, Streamlit):** [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)
 - PDF export: [`docs/pdf/DOCUMENTATION.pdf`](docs/pdf/DOCUMENTATION.pdf)
+- **Split Voice — 4 slides for PPT designer:**
+  - [`docs/pdf/VOICE_4_SLIDES.pptx`](docs/pdf/VOICE_4_SLIDES.pptx) — PowerPoint reference (Definition · Why · Architecture · Key points)
+  - [`docs/pdf/VOICE_4_SLIDES.pdf`](docs/pdf/VOICE_4_SLIDES.pdf) — same 4 slides as PDF
+  - Teammate brief: [`docs/pdf/VOICE_TEAMMATE_BRIEF.pdf`](docs/pdf/VOICE_TEAMMATE_BRIEF.pdf)
+  - **Presenter full awareness:** [`docs/pdf/VOICE_FULL_AWARENESS.pdf`](docs/pdf/VOICE_FULL_AWARENESS.pdf) — everything about voice for your talk
+  - Regenerate awareness: `python docs/_export_voice_awareness.py`
 
 ## Deploy
 

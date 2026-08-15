@@ -3,13 +3,25 @@ Admin-related models for the hospital chatbot application.
 
 This module contains models for dashboard users and configurable settings
 for managing the hospital chatbot system at tenant and clinic levels.
+
+Roles (AdminUser.role):
+  - company_admin — all clinics under the user's tenant
+  - clinic_admin  — only clinics listed in admin_user_clinics
 """
 
 from datetime import datetime
-from typing import Optional, TYPE_CHECKING
+from typing import List, Optional, TYPE_CHECKING
 
 from sqlalchemy import (
-    Boolean, DateTime, ForeignKey, Integer, String, Text, Index, UniqueConstraint, func
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    Index,
+    UniqueConstraint,
+    func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -19,6 +31,11 @@ if TYPE_CHECKING:
     from app.models.core_models import Tenant, Clinic
 
 
+ROLE_COMPANY_ADMIN = "company_admin"
+ROLE_CLINIC_ADMIN = "clinic_admin"
+ADMIN_ROLES = frozenset({ROLE_COMPANY_ADMIN, ROLE_CLINIC_ADMIN})
+
+
 class AdminUser(Base):
     """
     AdminUser model representing dashboard users.
@@ -26,30 +43,34 @@ class AdminUser(Base):
     Tracks users who can manage the hospital chatbot system,
     including their roles, access levels, and login activity.
     """
+
     __tablename__ = "admin_users"
 
     user_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     tenant_id: Mapped[int] = mapped_column(
         Integer,
         ForeignKey("tenants.tenant_id", ondelete="CASCADE"),
-        nullable=False
+        nullable=False,
     )
     email: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[str] = mapped_column(String(50), nullable=False)
-    active_flag: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+    password_hash: Mapped[Optional[str]] = mapped_column(String(255))
+    active_flag: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="true"
+    )
     last_login: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
     # Audit fields
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         server_default=func.now(),
-        nullable=False
+        nullable=False,
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
         server_default=func.now(),
         onupdate=func.now(),
-        nullable=False
+        nullable=False,
     )
 
     created_by: Mapped[Optional[str]] = mapped_column(String(255))
@@ -58,20 +79,64 @@ class AdminUser(Base):
     # Relationships
     tenant: Mapped["Tenant"] = relationship(
         "Tenant",
-        back_populates="admin_users"
+        back_populates="admin_users",
+    )
+    clinic_links: Mapped[List["AdminUserClinic"]] = relationship(
+        "AdminUserClinic",
+        back_populates="user",
+        cascade="all, delete-orphan",
     )
 
     # Indexes and constraints
     __table_args__ = (
         UniqueConstraint(
-            'tenant_id',
-            'email',
-            name='uq_admin_user_tenant_email',
+            "tenant_id",
+            "email",
+            name="uq_admin_user_tenant_email",
         ),
-        Index('idx_admin_user_tenant', 'tenant_id'),
-        Index('idx_admin_user_email', 'email'),
-        Index('idx_admin_user_role', 'role'),
-        Index('idx_admin_user_active', 'active_flag'),
+        Index("idx_admin_user_tenant", "tenant_id"),
+        Index("idx_admin_user_email", "email"),
+        Index("idx_admin_user_role", "role"),
+        Index("idx_admin_user_active", "active_flag"),
+    )
+
+
+class AdminUserClinic(Base):
+    """Which clinics a clinic_admin may open. Ignored for company_admin."""
+
+    __tablename__ = "admin_user_clinics"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("admin_users.user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    clinic_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("clinics.clinic_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    user: Mapped["AdminUser"] = relationship(
+        "AdminUser",
+        back_populates="clinic_links",
+    )
+    clinic: Mapped["Clinic"] = relationship("Clinic")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "clinic_id",
+            name="uq_admin_user_clinic",
+        ),
+        Index("idx_admin_user_clinic_user", "user_id"),
+        Index("idx_admin_user_clinic_clinic", "clinic_id"),
     )
 
 
@@ -82,18 +147,19 @@ class ConfigSetting(Base):
     Stores key-value configuration pairs for each clinic,
     allowing customization of chatbot behavior and features.
     """
+
     __tablename__ = "config_settings"
 
     setting_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     tenant_id: Mapped[int] = mapped_column(
         Integer,
         ForeignKey("tenants.tenant_id"),
-        nullable=False
+        nullable=False,
     )
     clinic_id: Mapped[int] = mapped_column(
         Integer,
         ForeignKey("clinics.clinic_id", ondelete="CASCADE"),
-        nullable=False
+        nullable=False,
     )
     key: Mapped[str] = mapped_column(String(100), nullable=False)
     value: Mapped[Optional[str]] = mapped_column(Text)
@@ -102,13 +168,13 @@ class ConfigSetting(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         server_default=func.now(),
-        nullable=False
+        nullable=False,
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
         server_default=func.now(),
         onupdate=func.now(),
-        nullable=False
+        nullable=False,
     )
 
     created_by: Mapped[Optional[str]] = mapped_column(String(255))
@@ -118,13 +184,13 @@ class ConfigSetting(Base):
     tenant: Mapped["Tenant"] = relationship("Tenant")
     clinic: Mapped["Clinic"] = relationship(
         "Clinic",
-        back_populates="config_settings"
+        back_populates="config_settings",
     )
 
     # Indexes and constraints
     __table_args__ = (
-        Index('idx_config_setting_tenant', 'tenant_id'),
-        Index('idx_config_setting_clinic', 'clinic_id'),
-        Index('idx_config_setting_key', 'key'),
-        UniqueConstraint('clinic_id', 'key', name='uq_config_setting_clinic_key'),
+        Index("idx_config_setting_tenant", "tenant_id"),
+        Index("idx_config_setting_clinic", "clinic_id"),
+        Index("idx_config_setting_key", "key"),
+        UniqueConstraint("clinic_id", "key", name="uq_config_setting_clinic_key"),
     )
