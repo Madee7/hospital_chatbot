@@ -15,7 +15,8 @@ hospital chatbot production server.
 | GitHub secret | `WINDOWS_SSH_KEY` = OpenSSH **private** key |
 | Server public key file | `C:\ProgramData\ssh\administrators_authorized_keys` |
 | Backend service | `HospitalChatbotBackend` (restarted on every deploy) |
-| Streamlit | **Not** a Windows service; code updates on disk, restart manually |
+| Dashboard service | `HospitalChatbotDashboard` (Streamlit via NSSM; restarted on deploy if installed) |
+| Streamlit install | One-time: `scripts\install_streamlit_service.ps1` (needs NSSM) |
 
 ### Deploy steps (every successful run)
 
@@ -24,6 +25,7 @@ hospital chatbot production server.
 3. `pip install -r requirements.txt` (supports `venv` or `.venv`)
 4. `python -m alembic upgrade head`
 5. `Restart-Service HospitalChatbotBackend`
+6. `Restart-Service HospitalChatbotDashboard` (if the service exists)
 
 ## Architecture
 
@@ -42,6 +44,7 @@ C:\apps\hospital-chatbot
    ├── git pull origin main
    ├── pip + alembic
    └── Restart-Service HospitalChatbotBackend
+       Restart-Service HospitalChatbotDashboard (if installed)
 ```
 
 ## GitHub secrets
@@ -117,19 +120,40 @@ If you see `SSH_OK`, GitHub can use the same private key via `WINDOWS_SSH_KEY`.
 | Backend (`app/`, webhook, voice, etc.) | **Yes** | Service restart loads new code |
 | DB migrations (`alembic/`) | **Yes** | `alembic upgrade head` |
 | Python deps (`requirements.txt`) | **Yes** | `pip install -r requirements.txt` |
-| Streamlit dashboard (`dashboard/`) | **Files only** | Restart Streamlit manually |
+| Streamlit dashboard (`dashboard/`) | **Yes** if `HospitalChatbotDashboard` service is installed | Otherwise restart Streamlit / the service manually |
 | `.env` / secrets on server | **No** | Edit on server; never commit secrets |
 | Branches other than `main` | **No** | Only `main` triggers deploy |
 
-### Restart Streamlit manually
+### Install Streamlit as a Windows service (one-time)
+
+So the dashboard keeps running after PowerShell closes / reboot:
+
+1. Download [NSSM](https://nssm.cc/download) and put `win64\nssm.exe` at `C:\tools\nssm\nssm.exe`
+2. On the server as Administrator:
 
 ```powershell
 cd C:\apps\hospital-chatbot
-# Stop the existing Streamlit process/window, then:
-.\venv\Scripts\streamlit.exe run dashboard/streamlit_app.py --server.address 0.0.0.0 --server.port 8501
+git pull origin main
+powershell -ExecutionPolicy Bypass -File .\scripts\install_streamlit_service.ps1
+Get-Service HospitalChatbotDashboard
 ```
 
-Dashboard URL: `http://196.219.86.38:8501/`
+3. Open `http://196.219.86.38:8501/`
+
+### Restart Streamlit service
+
+```powershell
+Restart-Service HospitalChatbotDashboard
+Get-Service HospitalChatbotDashboard
+Get-Content C:\apps\hospital-chatbot\logs\streamlit_stderr.log -Tail 40 -Encoding UTF8
+```
+
+Manual (no service) fallback:
+
+```powershell
+cd C:\apps\hospital-chatbot
+.\venv\Scripts\streamlit.exe run dashboard/streamlit_app.py --server.address 0.0.0.0 --server.port 8501
+```
 
 ## How to deploy day to day
 

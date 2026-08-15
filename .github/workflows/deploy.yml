@@ -56,5 +56,13 @@ jobs:
             Restart-Service HospitalChatbotBackend -Force
             Get-Service HospitalChatbotBackend
 
+            if (Get-Service HospitalChatbotDashboard -ErrorAction SilentlyContinue) {
+              Write-Host '==> restart HospitalChatbotDashboard'
+              Restart-Service HospitalChatbotDashboard -Force
+              Get-Service HospitalChatbotDashboard
+            } else {
+              Write-Host '==> HospitalChatbotDashboard not installed (optional); skip'
+            }
+
             Write-Host '==> deploy OK'
             git rev-parse --short HEAD
