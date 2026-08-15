@@ -345,7 +345,7 @@ def page_clinics_mgmt(db, user: dict) -> None:
                 st.error(str(exc))
 
 
-def page_kpis(db, clinic_id: int) -> None:
+def page_kpis(db, clinic_id: int, *, show_costs: bool = False) -> None:
     st.subheader(_ui("dashboard_kpis"))
     days = st.slider(_ui("period_days"), 7, 90, 30)
     k = admin.compute_kpis(db, clinic_id=clinic_id, days=days)
@@ -366,11 +366,12 @@ def page_kpis(db, clinic_id: int) -> None:
     c9.metric(_ui("voice_notes"), k["voice_usage_count"])
     c10.metric(_ui("voice_minutes"), k["voice_usage_minutes"])
     c11.metric(_ui("handover_open"), k["handover_open"])
-    c12.metric(_ui("est_cost"), f"${k['estimated_cost']:.4f}")
+    if show_costs:
+        c12.metric(_ui("est_cost"), f"${k['estimated_cost']:.4f}")
 
-    c13, c14, _, _ = st.columns(4)
-    c13.metric(_ui("voice_cost"), f"${k.get('voice_estimated_cost', 0.0):.4f}")
-    c14.metric(_ui("voice_cost_avg"), f"${k.get('voice_cost_avg', 0.0):.4f}")
+        c13, c14, _, _ = st.columns(4)
+        c13.metric(_ui("voice_cost"), f"${k.get('voice_estimated_cost', 0.0):.4f}")
+        c14.metric(_ui("voice_cost_avg"), f"${k.get('voice_cost_avg', 0.0):.4f}")
 
     left, right = st.columns(2)
     with left:
@@ -1141,7 +1142,7 @@ def main() -> None:
     company = _is_company_admin(user)
     screen_keys = [k for k, _ in SCREENS]
     if not company:
-        screen_keys = [k for k in screen_keys if k not in {"users", "clinics"}]
+        screen_keys = [k for k in screen_keys if k not in {"users", "clinics", "usage"}]
     page_key = st.sidebar.radio(
         _ui("screen"),
         options=screen_keys,
@@ -1159,7 +1160,7 @@ def main() -> None:
             st.error(_ui("clinic_access_denied"))
             return
         if page_key == "kpis":
-            page_kpis(db, clinic_id)
+            page_kpis(db, clinic_id, show_costs=company)
         elif page_key == "clinic_setup":
             page_clinic(db, clinic_id)
         elif page_key == "departments":
@@ -1178,7 +1179,7 @@ def main() -> None:
             page_reminders(db, clinic_id)
         elif page_key == "settings":
             page_settings(db, clinic_id)
-        elif page_key == "usage":
+        elif page_key == "usage" and company:
             page_usage(db, clinic_id)
         elif page_key == "users" and company:
             page_users(db, user)

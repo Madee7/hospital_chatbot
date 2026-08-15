@@ -972,37 +972,40 @@ def compute_kpis(db: Session, *, clinic_id: int, days: int = 30) -> dict[str, An
         or 0
     )
 
-    booking_attempts = (
+    # Conversations that asked to book (intent) or reached a booking step (state).
+    booking_conversations = (
         db.query(func.count(Conversation.conversation_id))
         .filter(
             Conversation.clinic_id == clinic_id,
             Conversation.created_at >= since,
-            Conversation.current_intent.isnot(None),
-            Conversation.current_intent.ilike("%book%"),
-        )
-        .scalar()
-        or 0
-    )
-    # Also count conversations that reached booking states historically via intent prefixes
-    booking_attempts_extra = (
-        db.query(func.count(Conversation.conversation_id))
-        .filter(
-            Conversation.clinic_id == clinic_id,
-            Conversation.created_at >= since,
-            Conversation.state.in_(
-                [
-                    ConversationState.BOOKING_DOCTOR,
-                    ConversationState.BOOKING_DATE,
-                    ConversationState.BOOKING_SLOT,
-                    ConversationState.PATIENT_DETAILS,
-                    ConversationState.CONFIRMING,
-                ]
+            or_(
+                Conversation.current_intent.ilike("%book%"),
+                Conversation.state.in_(
+                    [
+                        ConversationState.BOOKING_DOCTOR,
+                        ConversationState.BOOKING_DATE,
+                        ConversationState.BOOKING_SLOT,
+                        ConversationState.PATIENT_DETAILS,
+                        ConversationState.CONFIRMING,
+                    ]
+                ),
             ),
         )
         .scalar()
         or 0
     )
-    booking_attempts = max(booking_attempts, booking_attempts_extra)
+    # Appointment rows created in the period are concrete attempts (any status),
+    # so conversion compares like with like and can never exceed 100%.
+    appointment_attempts = (
+        db.query(func.count(Appointment.appointment_id))
+        .filter(
+            Appointment.clinic_id == clinic_id,
+            Appointment.created_at >= since,
+        )
+        .scalar()
+        or 0
+    )
+    booking_attempts = max(booking_conversations, appointment_attempts)
 
     confirmed = (
         db.query(func.count(Appointment.appointment_id))
@@ -1047,7 +1050,8 @@ def compute_kpis(db: Session, *, clinic_id: int, days: int = 30) -> dict[str, An
         or 0
     )
 
-    conversion = (confirmed / booking_attempts) if booking_attempts else 0.0
+    # Successful bookings over total attempts, clamped to 0-100%.
+    conversion = min(confirmed / booking_attempts, 1.0) if booking_attempts else 0.0
 
     failed_intents = (
         db.query(func.count(Conversation.conversation_id))
