@@ -1,5 +1,8 @@
 # Virtual Environment
 venv/
+.venv/
+.pytest_cache/
+docs/_pdf_tmp/
 
 # Python
 __pycache__/

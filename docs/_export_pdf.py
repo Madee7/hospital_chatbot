@@ -1,8 +1,15 @@
-"""Convert docs/DOCUMENTATION.md to docs/pdf/DOCUMENTATION.pdf via Chrome."""
+"""Convert a docs/*.md guide to docs/pdf/*.pdf via headless Chrome.
+
+Usage:
+    python docs/_export_pdf.py                 # DOCUMENTATION.md
+    python docs/_export_pdf.py COST            # COST.md
+    python docs/_export_pdf.py DOCUMENTATION COST
+"""
 from __future__ import annotations
 
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -15,7 +22,7 @@ out_dir.mkdir(exist_ok=True)
 html_dir.mkdir(exist_ok=True)
 
 CHROME = Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
-SRC = docs / "DOCUMENTATION.md"
+DEFAULT_STEMS = ["DOCUMENTATION"]
 
 css = """
 @page { size: A4; margin: 14mm; }
@@ -129,24 +136,23 @@ def fix_img_paths(html: str) -> str:
     return re.sub(r'src="([^"]+)"', repl, html)
 
 
-def main() -> None:
-    if not CHROME.exists():
-        raise SystemExit(f"Chrome not found: {CHROME}")
-    if not SRC.exists():
-        raise SystemExit(f"Missing {SRC}")
+def export(stem: str) -> None:
+    src = docs / f"{stem}.md"
+    if not src.exists():
+        raise SystemExit(f"Missing {src}")
 
-    text = SRC.read_text(encoding="utf-8")
     body = markdown.markdown(
-        text, extensions=["tables", "fenced_code", "sane_lists", "toc"]
+        src.read_text(encoding="utf-8"),
+        extensions=["tables", "fenced_code", "sane_lists", "toc"],
     )
     body = fix_img_paths(body)
     html = (
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
         f"<style>{css}</style></head><body>{body}</body></html>"
     )
-    html_path = html_dir / "DOCUMENTATION.html"
+    html_path = html_dir / f"{stem}.html"
     html_path.write_text(html, encoding="utf-8")
-    pdf_path = out_dir / "DOCUMENTATION.pdf"
+    pdf_path = out_dir / f"{stem}.pdf"
     if pdf_path.exists():
         try:
             pdf_path.unlink()
@@ -168,6 +174,13 @@ def main() -> None:
             break
         time.sleep(0.25)
     print("OK", pdf_path, pdf_path.stat().st_size if pdf_path.exists() else 0)
+
+
+def main() -> None:
+    if not CHROME.exists():
+        raise SystemExit(f"Chrome not found: {CHROME}")
+    for stem in sys.argv[1:] or DEFAULT_STEMS:
+        export(stem.removesuffix(".md"))
 
 
 if __name__ == "__main__":

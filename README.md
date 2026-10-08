@@ -18,7 +18,7 @@ AI-powered WhatsApp chatbot for hospital appointment booking, rescheduling, canc
 - Search by specialty or doctor name
 - Arabic and English conversation support
 - Voice-note understanding (STT + guided booking flow)
-- Admin dashboard for clinic operations and KPIs
+- Admin dashboard for clinic operations and KPIs, with company-admin and clinic-admin roles
 - Usage / cost related logging
 
 ## Quick Start (Local)
@@ -71,9 +71,11 @@ Run from the repo root. `DATABASE_URL` comes from `.env` / `app.core.config`, no
 
 ## Documentation
 
-- **Full technical & architecture guide (v4):** [`docs/DOCUMENTATION.md`](docs/DOCUMENTATION.md) — product → architecture → ops → reference; figures + GUI screenshots
-- **Deploy guide (SSH, secrets, Streamlit):** [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)
-- PDF export: [`docs/pdf/DOCUMENTATION.pdf`](docs/pdf/DOCUMENTATION.pdf)
+- **Full technical & architecture guide (v5):** [`docs/DOCUMENTATION.md`](docs/DOCUMENTATION.md) — product → architecture → ops → reference; figures + GUI screenshots; Phase 2 dashboard changes in §24; limitations, capacity, and the voice-latency plan in §25
+- **Model prices & what $1 buys:** [`docs/COST.md`](docs/COST.md) — what our transcription and planner models cost per voice note, every credible alternative priced on the same workload, and per-dollar capacity
+- **$1 table for slides:** [`docs/pdf/COST_ONE_DOLLAR.pdf`](docs/pdf/COST_ONE_DOLLAR.pdf) · drop-in image [`docs/images/cost-one-dollar.png`](docs/images/cost-one-dollar.png) · editable PPT [`docs/pdf/COST_ONE_DOLLAR.pptx`](docs/pdf/COST_ONE_DOLLAR.pptx)
+- **Deploy guide (SSH, secrets, Streamlit service):** [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)
+- PDF exports: [`docs/pdf/DOCUMENTATION.pdf`](docs/pdf/DOCUMENTATION.pdf) · [`docs/pdf/COST.pdf`](docs/pdf/COST.pdf) — regenerate with `python docs/_export_pdf.py DOCUMENTATION COST`
 - **Split Voice — 4 slides for PPT designer:**
   - [`docs/pdf/VOICE_4_SLIDES.pptx`](docs/pdf/VOICE_4_SLIDES.pptx) — PowerPoint reference (Definition · Why · Architecture · Key points)
   - [`docs/pdf/VOICE_4_SLIDES.pdf`](docs/pdf/VOICE_4_SLIDES.pdf) — same 4 slides as PDF

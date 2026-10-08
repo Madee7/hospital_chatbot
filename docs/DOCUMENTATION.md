@@ -2,11 +2,11 @@
 
 | | |
 |:--|:--|
-| **Version** | 4.2 |
-| **Updated** | 2026-08-15 |
+| **Version** | 5.2 |
+| **Updated** | 2026-08-16 |
 | **Repository** | [Ghena-A/hospital-chatbot](https://github.com/Ghena-A/hospital-chatbot) |
 | **API** | FastAPI `1.0.0` — `uvicorn app.main:app` |
-| **Related** | [`README.md`](../README.md) · [`DEPLOYMENT.md`](DEPLOYMENT.md) · `docs/pdf/DOCUMENTATION.pdf` |
+| **Related** | [`README.md`](../README.md) · [`DEPLOYMENT.md`](DEPLOYMENT.md) · [`COST.md`](COST.md) · `docs/pdf/DOCUMENTATION.pdf` |
 | **Figures** | Architecture: `docs/images/fig01`–`fig12` · GUI: `docs/images/gui/` |
 
 > **How to read this guide**  
@@ -14,14 +14,16 @@
 > **Act I — Why we built this:** §§1–5 (the problem, who we serve, how a visit feels, what the screens look like).  
 > **Act II — The journeys we protect:** §§6–16 (architecture, booking, voice, safety).  
 > **Act III — The system of record:** §§17–22 (database, dashboard, config, deploy, tests).  
-> **Act IV — The words we give the model:** §§23–26 (prompts explained, timeline, history, appendix).  
+> **Act IV — The words we give the model:** §§23–28 (prompts explained, Phase 2 changes, limitations, timeline, history, appendix).  
 > Every flow picture has its own description underneath. Do not skip the captions.
+>
+> **Money lives elsewhere.** [`COST.md`](COST.md) is a short price comparison: what our models cost, what the alternatives cost, and what one dollar buys. Limitations, capacity, and voice latency stay **here**, in §25.
 
 ---
 
 ## Table of contents
 
-Read in order. Section numbers **1–26** are the index; the acts are the story.
+Read in order. Section numbers **1–28** are the index; the acts are the story.
 
 ### Act I — Why we built this
 
@@ -52,11 +54,7 @@ Read in order. Section numbers **1–26** are the index; the acts are the story.
     - 15.3 [Components](#153-components)
     - 15.4 [Goals, next steps, and the furthest-justified rule](#154-goals-next-steps-and-the-furthest-justified-rule)
     - 15.5 [Why a voice reply can take 15 seconds](#155-why-a-voice-reply-can-take-15-seconds)
-    - 15.6 [Server limitations](#156-server-limitations)
-    - 15.7 [How to reduce voice latency](#157-how-to-reduce-voice-latency)
-    - 15.8 [Cost model](#158-cost-model)
-    - 15.9 [What one dollar provides](#159-what-one-dollar-provides)
-    - 15.10 [Cost and latency observability](#1510-cost-and-latency-observability)
+    - 15.6 [How to reduce voice latency](#156-how-to-reduce-voice-latency)
 16. [Safety & Handover](#16-safety-handover)
 
 ### Act III — The system of record
@@ -78,9 +76,24 @@ Read in order. Section numbers **1–26** are the index; the acts are the story.
     - 23.5 [Language rules](#235-language-rules-patient-facing)
     - 23.6 [Receptionist persona (EN)](#236-receptionist-persona-en)
     - 23.7 [Receptionist persona (AR)](#237-receptionist-persona-ar)
-24. [Version Control & Timeline](#24-version-control-timeline)
-25. [Document History](#25-document-history)
-26. [Appendix](#26-appendix)
+24. [Phase 2 — what changed recently](#24-phase-2--what-changed-recently)
+    - 24.1 [The shape of Phase 2](#241-the-shape-of-phase-2)
+    - 24.2 [Real accounts, real roles](#242-real-accounts-real-roles)
+    - 24.3 [Many clinics, one dashboard](#243-many-clinics-one-dashboard)
+    - 24.4 [Who may see money](#244-who-may-see-money)
+    - 24.5 [Conversion that cannot exceed 100%](#245-conversion-that-cannot-exceed-100)
+    - 24.6 [The dashboard survives a closed window](#246-the-dashboard-survives-a-closed-window)
+    - 24.7 [Schema and configuration changes](#247-schema-and-configuration-changes)
+    - 24.8 [Known gaps after Phase 2](#248-known-gaps-after-phase-2)
+25. [Limitations & how to make voice faster](#25-limitations--how-to-make-voice-faster)
+    - 25.1 [What we actually run](#251-what-we-actually-run)
+    - 25.2 [The real limits](#252-the-real-limits)
+    - 25.3 [Capacity, honestly framed](#253-capacity-honestly-framed)
+    - 25.4 [The 24-hour WhatsApp wall](#254-the-24-hour-whatsapp-wall)
+    - 25.5 [Making a voice reply faster](#255-making-a-voice-reply-faster)
+26. [Version Control & Timeline](#26-version-control-timeline)
+27. [Document History](#27-document-history)
+28. [Appendix](#28-appendix)
 
 ### List of figures
 
@@ -100,8 +113,11 @@ Each figure is a scene in the story. The meaning lives **under the image**, not 
 | 10 | Reminders & handover | We nudge before the visit; we never abandon a human in need | `images/fig10-reminders-handover.png` |
 | 11 | Configuration architecture | Knobs in `.env` and per-clinic settings, never hard-coded panic | `images/fig11-config-architecture.png` |
 | 12 | Admin dashboard map | Staff see the same appointments the patient just confirmed | `images/fig12-admin-dashboard.png` |
-| G1–G31 | Live GUI | WhatsApp + Streamlit as the patient and the clinic actually see them | `images/gui/` (§5) |
-| G32–G33 | Ops | Actions / server — how the story stays on the air | under §21 |
+| G1–G19 | Live WhatsApp | The patient's side, exactly as it arrives on their phone | `images/gui/wa-*.png` (§5.1–§5.5) |
+| G20–G30 | Live dashboard | The clinic's side after Phase 2 — role badge, clinic selector, every operational screen | `images/gui/dash-*.png` (§5.6) |
+| G31–G32 | Users & Clinics | Accounts, roles, and multi-clinic administration | under §24.3 |
+| G33–G34 | Ops | A green deploy and the server behind the clinic number | under §21 |
+| C1–C3 | Usage & spend screens | What listening cost, and who is allowed to see it | [`COST.md`](COST.md) §1, §7 |
 
 ---
 
@@ -529,62 +545,65 @@ This is the heart of the voice story: a voice note, a transcript, a plan, then t
 
 ### 5.6 Admin dashboard (Streamlit)
 
-The other half of the promise: the clinic is not flying blind.
+The other half of the promise: the clinic is not flying blind. Every screenshot below is the **current** dashboard, after Phase 2 — signed in as `admin@demo.local` with the `company_admin` badge under the email, and one clinic selected in the sidebar.
 
-![G20 — Sidebar navigation](images/gui/dash-sidebar-nav.png)
+![G20 — KPIs](images/gui/dash-kpis.png)
 
-**Figure G20 — The clinic’s map of the same world**
+**Figure G20 — Did we help, and where did we lose people?**
 
-Clinic selector plus every operational screen. Staff are not in a different app’s fantasy; they are in PostgreSQL with a human face.
+The sidebar is the clinic's map of the same world: language, the signed-in account and its role, the clinic selector, then every operational screen. The body is the answer to “is this working?” for the period the clinic chooses.
 
 | | |
 |:--|:--|
-| **What staff open** | Sidebar: KPIs, Clinic setup, Departments, Doctors, Hours, Schedule, Appointments, Conversations, Reminders, Settings, Usage. |
-| **What to notice** | One clinic context at a time. Password at the door. |
+| **What staff open** | KPIs, Clinic setup, Departments, Doctors, Working hours, Doctor schedule, Appointments, Conversations, Reminders, Settings — plus Usage / costs, Users, and Clinics, which only a company admin sees. |
+| **What this capture says** | 9 conversations, 24 booking attempts, 19 confirmed, **79.2 % conversion**, 5 cancelled, 9 rescheduled, 0 no-shows, 0 failed intents, 116 voice notes over 7.45 minutes, 8 open handovers. |
+| **What to notice** | Conversion is now confirmed ÷ attempts and **cannot exceed 100 %** (§24.5). The three spend metrics on this screen are visible here only because this account is a company admin (§24.4). |
 
 ![G21 — Clinic setup](images/gui/dash-clinic-setup.png)
 
-**Figure G21 — Name, number, timezone, language.** The identity the patient hears. Wrong timezone is a wrong clock.
+**Figure G21 — Name, number, timezone, language, map.** The identity the patient hears, plus the Google Maps URL that becomes the short link in a confirmation. Wrong timezone is a wrong clock.
 
-![G22 — KPIs](images/gui/dash-kpis.png)
+![G22 — Departments](images/gui/dash-departments.png)
 
-**Figure G22 — Did we help, and at what cost?** Conversations, bookings, voice spend, handovers — for a period the clinic chooses.
+**Figure G22 — Specialties in two languages.** The nine departments behind “By specialty” — Cardiology through OB/GYN — each with EN and AR names and an `active_flag` the bot respects.
 
-![G23 — Departments](images/gui/dash-departments.png)
+![G23 — Doctors](images/gui/dash-doctors-table.png)
 
-**Figure G23 — Specialties in two languages.** The list behind “By specialty.”
+**Figure G23 — The people patients ask for by name.** EN/AR names, title, specialization, and both bios. This table is what makes “عايز دكتور نور الدين” resolvable.
 
-![G24 — Doctors](images/gui/dash-doctors-table.png)
+![G24 — Add or edit a doctor](images/gui/dash-doctor-form.png)
 
-**Figure G24 — The people patients ask for by name.** EN/AR names, title, specialization, bio.
+**Figure G24 — Bilingual by construction.** Name AR, Name EN, title, specialization, both bios, photo URL. A doctor added here is bookable on WhatsApp without a deploy.
 
 ![G25 — Working hours](images/gui/dash-working-hours.png)
 
-**Figure G25 — When a doctor is actually in the building.** Slot length and max bookings become the calendar the bot is allowed to offer.
+**Figure G25 — When a doctor is actually in the building.** Weekday, start, end, slot length, max bookings — and a second tab for holidays and leave. Slots are generated from this after save; the bot may only offer what these rows allow.
 
 ![G26 — Booked & free slots](images/gui/dash-slots-booked-tab.png)
 
-**Figure G26 — Free, booked, held, blocked.** Held is the three-minute promise in motion. Blocked is leave or holiday — we will not sell those hours.
+**Figure G26 — Free, booked, held, blocked.** 48 free and nothing booked for this doctor in the next 14 days. Held is the three-minute promise in motion; blocked is leave or holiday, and we will not sell those hours. Confirmed slots stay hidden from WhatsApp until cancelled.
 
 ![G27 — Appointments](images/gui/dash-appointments.png)
 
-**Figure G27 — Every confirmed visit, with references.** Filter by status. This is the diary the WhatsApp thread wrote.
+**Figure G27 — Every visit, with its reference.** `APT-YYYYMMDD-XXXX`, status, patient, phone, doctor, specialty, slot start/end, slot status, timestamps. Filter by status. This is the diary the WhatsApp thread wrote.
 
 ![G28 — Conversations](images/gui/dash-conversations-table.png)
 
-**Figure G28 — Where a handover lives.** State, intent, patient, last update — so reception is not starting from zero.
+**Figure G28 — Where a handover lives.** State, current intent, patient, last update — and the transcript below, message by message with direction and delivery status. Reception never starts from zero.
 
-![G29 — Settings](images/gui/dash-settings-form.png)
+![G29 — Reminders](images/gui/dash-reminders.png)
 
-**Figure G29 — Reminder hours, escalation number, consent text.** Policy without a redeploy when it is stored per clinic.
+**Figure G29 — Two knocks per appointment, queued.** `24h_before` and `2h_before` rows with `scheduled_at`, `sent_at`, status, and `template_name = appointment_reminder`. **Process due**, **Force all pending**, and **Retry failed** are the operator's controls.
 
-![G30 — Usage / costs](images/gui/dash-usage-costs-full.png)
+| | |
+|:--|:--|
+| **What to notice** | Every row here is `pending` with `retry_count = 0`. A row whose scheduled time is more than 24 hours after the patient's last message cannot be delivered as free-form text — that is the WhatsApp template wall of §14 and §25.4, not a worker bug. |
 
-**Figure G30 — Whisper and GPT are not free, and we do not hide that.** Counts plus provider/operation breakdown.
+![G30 — Settings](images/gui/dash-settings-form.png)
 
-![G31 — Recent usage logs](images/gui/dash-usage-logs-full.png)
+**Figure G30 — Policy without a redeploy.** Reminder hours (`24,2`), reminder template name, escalation WhatsApp number, fallback wording, and consent text — stored per clinic.
 
-**Figure G31 — One call at a time:** tokens, cost, latency, status. The audit of how we listened.
+The **Usage / costs** and **Recent usage logs** screens belong to the money story, so they live with the money: see [`COST.md`](COST.md) §1 (Figures C1–C2) for those screenshots and what every column means. The two company-admin management screens, **Users** and **Clinics**, are shown where they are explained: §24.3.
 
 ## 6. System Architecture
 
@@ -817,7 +836,7 @@ Left: after confirm, we schedule reminders (default 24h and 2h) and a worker sen
 | | |
 |:--|:--|
 | **The problem it solves** | No-shows from forgotten visits; bots that trap people who needed a receptionist. |
-| **What to notice** | Reminders after 24 hours often need WhatsApp **templates** (billable). Handover is a first-class case in the dashboard. |
+| **What to notice** | A reminder sent more than 24 hours after the patient's last message needs an approved WhatsApp **template**, which the sender does not use yet — see §14 and §25.4. Handover is a first-class case in the dashboard. |
 
 ### 9.6 Admin → DB
 
@@ -1015,10 +1034,14 @@ A confirmed visit is easy to forget when life is loud. We write two knocks on th
 
 - Created at booking: offsets from `REMINDER_HOURS_BEFORE` (default 24h, 2h).
 - Type string pattern: `{hours}h_before` (e.g. `24h_before`).
-- Template: `appointment_reminder` (WhatsApp templates may be billable after the 24-hour session window).
-- Worker: `python -m app.scripts.run_reminders` (`--dry-run` supported).
-- Cancel/reschedule clears pending reminders.
+- Rows carry `template_name="appointment_reminder"`, but `process_due_reminders()` sends a **free-form interactive button message** (`wa.send_buttons`) with Reschedule / Cancel / MENU.
+- Worker: `python -m app.scripts.run_reminders` (`--dry-run`, `--force`, `--limit`, `--loop` supported).
+- Cancel/reschedule clears pending reminders; a failed send sets `status=failed` and increments `retry_count`.
 - Meta delivery receipts update status via webhook statuses handler.
+
+**The 24-hour wall.** WhatsApp only accepts free-form business messages inside the 24-hour customer-service window that each inbound patient message opens. A booking made days ahead means the `24h_before` reminder — and usually the `2h_before` one too — falls **outside** that window, where Meta requires a pre-approved, **paid** template. There is no `send_template()` in the WhatsApp client yet, so those sends fail structurally rather than transiently: retrying will not fix them.
+
+What that means for the roadmap — template approval, `send_template()`, funding the WhatsApp account, and the per-appointment budget line — is §25.4. Reminders sent *inside* the window, for example right after a booking or when the patient replies to a nudge, are free-form and free.
 
 ---
 
@@ -1062,7 +1085,7 @@ flowchart TD
 | `voice_schemas.py` | The shape of a plan: `goal`, `next_step`, `slots`, `confidence`. |
 | `voice_executor.py` | The clerk: check doctors and times in PostgreSQL, then walk the funnel. |
 | `voice_fastpath.py` | Older V1 shortcuts if the V2 router is off. |
-| `voice_cost.py` | We log what listening cost. No hidden meters. |
+| `voice_cost.py` | Prices every call — audio seconds, tokens, latency — into `usage_logs`. No hidden meters. Rates and formulas: [`COST.md`](COST.md). |
 
 **`slots` in a VoicePlan are extracted fields** (doctor, date, time, name, appointment ref) — not a calendar cell. The calendar cell is an `appointment_slots` row. Mixing those two words is how documents confuse clinics.
 
@@ -1119,26 +1142,9 @@ The code records `stt_latency_ms` and `chat_latency_ms`, but it does not yet rec
 
 Transient errors can make a request much slower. `_with_retries()` allows retries with **1-second and 3-second backoffs**. Meta requests also have 15-second (media metadata) and 30-second (audio download) timeouts. Those are protection limits, not expected normal durations.
 
-### 15.6 Server limitations
+The host itself is rarely the culprit: Whisper and GPT run on OpenAI's infrastructure, so a faster CPU here does not shorten them. The capacity and concurrency limits of the production server — single worker, in-memory drafts, `BackgroundTasks` instead of a durable queue — are catalogued with their remedies in §25.2.
 
-The repository documents the production host as a Windows server running `HospitalChatbotBackend`, PostgreSQL access, Streamlit, and a tunnel/service setup. It does **not** record CPU count, RAM, disk type, measured network latency, or the exact Windows-service Uvicorn command, so this guide does not invent hardware specifications.
-
-Known architectural limits are:
-
-| Limitation | Effect |
-|:-----------|:-------|
-| `uvicorn app.main:app` defaults to one worker unless the service overrides it | One process has limited concurrent throughput. |
-| Voice uses synchronous `requests` and synchronous OpenAI calls | Each active voice task occupies a worker thread while waiting on networks. |
-| FastAPI `BackgroundTasks` run inside the API process | A process restart can lose queued voice work; it is not a durable job queue. |
-| Booking draft data is held in `_SESSION[phone]` memory | Multiple workers cannot safely share drafts without Redis/DB state or sticky routing. |
-| STT and GPT are remote | Adding server CPU alone usually does not shorten model inference; network location and provider latency matter more. |
-| A temporary OGG file is created for every transcription | Small local disk overhead and extra I/O. |
-| One voice note requires Meta download + STT + GPT + Meta send | More external failure points than text messages. |
-| Dashboard, API, and operational processes share the host | Heavy dashboard queries or resource pressure can increase queueing. |
-
-Scaling Uvicorn workers before moving `_SESSION` to shared storage is risky: the next message may reach a different process and lose the in-progress draft.
-
-### 15.7 How to reduce voice latency
+### 15.6 How to reduce voice latency
 
 Recommended order—measure first, then optimize:
 
@@ -1157,121 +1163,7 @@ Recommended order—measure first, then optimize:
 
 What **not** to do: run local Whisper on a small CPU-only Windows server expecting it to be faster. Local inference is useful only when the host has appropriate hardware and it passes Arabic/Egyptian accuracy and latency tests.
 
-### 15.8 Cost model
-
-Two OpenAI operations are billed for a normal V2 voice note:
-
-1. **Whisper STT:** billed by audio duration.
-2. **GPT planner:** billed by input, cached-input, and output tokens.
-
-The project estimator in `app/services/voice_cost.py` currently uses:
-
-| Model / token class | Rate used by the project |
-|:--------------------|-------------------------:|
-| `whisper-1` | **$0.006 / audio minute** |
-| `gpt-4o-mini-transcribe` | **$0.003 / audio minute** |
-| `gpt-4o-mini` input | **$0.15 / 1M tokens** |
-| `gpt-4o-mini` cached input | **$0.075 / 1M tokens** |
-| `gpt-4o-mini` output | **$0.60 / 1M tokens** |
-
-Pricing changes over time. Verify the provider pricing page before a commercial quotation. The code supports overrides:
-
-```env
-VOICE_PRICE_STT_PER_MIN=0.006
-VOICE_PRICE_INPUT_PER_1M=0.15
-VOICE_PRICE_CACHED_PER_1M=0.075
-VOICE_PRICE_OUTPUT_PER_1M=0.60
-```
-
-Cost formulas:
-
-```text
-STT cost =
-  audio_seconds / 60 × STT_price_per_minute
-
-GPT cost =
-  uncached_input_tokens / 1,000,000 × input_rate
-  + cached_input_tokens / 1,000,000 × cached_rate
-  + output_tokens / 1,000,000 × output_rate
-
-Voice-note cost = STT cost + GPT cost
-```
-
-This excludes server hosting, PostgreSQL, bandwidth, Meta/WhatsApp conversation or template charges, monitoring, backups, and engineering/support time.
-
-### 15.9 What one dollar provides
-
-Using the rates above:
-
-#### Whisper only
-
-`$1 / $0.006 = 166.67 audio minutes`—about **2 hours 46 minutes 40 seconds** of transcription.
-
-| Average note length | STT cost per note | Approx. notes for $1 |
-|:--------------------|------------------:|---------------------:|
-| 5 seconds | $0.0005 | 2,000 |
-| 10 seconds | $0.0010 | 1,000 |
-| 14 seconds | $0.0014 | 714 |
-| 30 seconds | $0.0030 | 333 |
-| 60 seconds | $0.0060 | 166 |
-
-#### GPT-4o mini text only
-
-If every token were in one class, $1 buys approximately:
-
-| Token class | Approx. tokens for $1 |
-|:------------|----------------------:|
-| Uncached input | 6.67 million |
-| Cached input | 13.33 million |
-| Output | 1.67 million |
-
-Real planner calls combine all three, so they must use the formula—not one row alone.
-
-#### Complete voice pipeline
-
-The dashboard screenshot in this guide shows a real sample period with approximately:
-
-- 95 voice notes
-- 6.47 voice minutes
-- $0.0803 voice cost
-- about $0.0008 average per voice note
-
-At exactly that historical mix, **$1 would provide roughly 1,180 voice notes**. This is an observed estimate, not a guarantee: note duration, prompt size, cache hits, retries, model changes, and output length all change the result.
-
-For a more conservative 14-second example:
-
-```text
-Whisper: 14/60 × $0.006              = $0.001400
-Example GPT planner cost             ≈ $0.000438
-Estimated combined cost              ≈ $0.001838
-$1 / $0.001838                       ≈ 544 voice notes
-```
-
-The example GPT component uses the observed dashboard average for `voice_parse`; production budgeting should use the latest 30-day p50/p95 token and cost data.
-
-### 15.10 Cost and latency observability
-
-`voice_cost.py` already returns:
-
-```json
-{
-  "stt_model": "whisper-1",
-  "stt_seconds": 14.0,
-  "stt_usd": 0.0014,
-  "stt_latency_ms": 5200,
-  "chat_model": "gpt-4o-mini",
-  "prompt_tokens": 3850,
-  "cached_tokens": 3000,
-  "completion_tokens": 120,
-  "chat_usd": 0.0002,
-  "chat_latency_ms": 3100,
-  "total_usd": 0.0016
-}
-```
-
-The numbers above illustrate the record shape; they are not a measured production request.
-
-One naming caveat: `usage_logs.tokens_or_minutes` stores **rounded audio seconds** for `voice_stt`, despite the generic column name. For `voice_parse`, it stores prompt + completion tokens. Dashboard labels should explain the unit per operation to avoid reading 388 seconds as 388 minutes.
+§25.5 ranks the same list by effort and impact, so read that one if you only have budget for two of these. Several steps also change the bill — cheaper transcription models, smaller prompts, fewer retries — and [`COST.md`](COST.md) prices those alternatives against what we pay today.
 
 ---
 
@@ -1320,9 +1212,10 @@ Tenant → clinic → departments, doctors, patients, conversations, slots, appo
 | VoiceMessage | `voice_messages` | Transcript, STT meta |
 | Reminder | `reminders` | CASCADE on appointment delete |
 | HandoverCase | `handover_cases` | Reason, priority, status |
-| AdminUser | `admin_users` | Dashboard users |
+| AdminUser | `admin_users` | Dashboard users: `email`, `role`, bcrypt `password_hash`, unique `(tenant_id, email)` |
+| AdminUserClinic | `admin_user_clinics` | Which clinics a `clinic_admin` may open (§24.3) |
 | ConfigSetting | `config_settings` | Per-clinic key/value |
-| UsageLog | `usage_logs` | Provider cost / latency |
+| UsageLog | `usage_logs` | Provider spend / latency per call |
 
 ### 17.3 Enums (`app/db/enums.py`)
 
@@ -1343,8 +1236,9 @@ Stored as **VARCHAR** via `sa_enum()` (not native PG ENUM).
 | Item | Detail |
 |:-----|:-------|
 | Tool | Alembic — `alembic/env.py` uses `DATABASE_URL` from config |
-| Current revision | `82401df5e5b2` (`baseline_existing_schema`) |
-| Deploy | `alembic upgrade head` |
+| Baseline | `82401df5e5b2` (`baseline_existing_schema`) |
+| Head | `a1b2c3d4e5f6` (`admin_auth_clinics`) — adds `password_hash`, creates `admin_user_clinics`, backfills hashes, renames legacy `admin` → `company_admin` |
+| Deploy | `alembic upgrade head` (runs in the Actions deploy) |
 | Existing full DB (once) | `alembic stamp head` |
 
 Authoritative columns: `app/models/*.py`.
@@ -1353,41 +1247,93 @@ Authoritative columns: `app/models/*.py`.
 
 ## 18. Admin Dashboard
 
-`dashboard/streamlit_app.py` + `ui_i18n.py` (EN/AR UI strings).
+`dashboard/streamlit_app.py` + `ui_i18n.py` (EN/AR UI strings). Screenshots: §5.6 (G20–G30) for the operational screens, §24.3 (G31–G32) for Users and Clinics.
 
 > See **Figure 12** in §9.6 — staff stand in the same story.
 
-### Access control
+Phase 2 rebuilt the door and the audience of this screen. The full change set is §24; this section is the current state.
 
-| Role | Access |
-|:-----|:-------|
-| `company_admin` | All clinics under the user's tenant; Users + Clinics screens |
-| `clinic_admin` | Only clinics linked in `admin_user_clinics` |
+### 18.1 Login
 
-Login is email + bcrypt `password_hash` on `admin_users` (no shared env password at runtime).  
-`ADMIN_DASHBOARD_PASSWORD` is used only when **seeding** or **migrating** to set the initial hash.
+| Step | What happens |
+|:-----|:-------------|
+| 1 | `require_login()` renders an email + password form; nothing else is reachable until it passes. |
+| 2 | `authenticate_admin(db, email, password)` looks up an **active** `admin_users` row for that email. |
+| 3 | `verify_password()` (`app/core/security.py`, bcrypt) checks the submitted password against `password_hash`. |
+| 4 | On success the user dict — `user_id`, `tenant_id`, `email`, `role` — goes into `st.session_state["auth"]` and `last_login` is stamped. |
+
+There is **no shared-password fallback and no any-email bypass**: `authenticate_admin()` accepts an `expected_password` argument only for call-site compatibility and ignores it.
+
+```python
+# app/services/admin_dashboard_service.py
+if not user or not verify_password(password, user.password_hash):
+    return None
+```
+
+`ADMIN_DASHBOARD_PASSWORD` / `ADMIN_BOOTSTRAP_PASSWORD` are used **only** by the migration and `seed_demo.py` to set an initial hash. Change the seeded passwords before a real clinic uses the dashboard.
 
 Demo accounts (after `python -m app.scripts.seed_demo`):
 
 | Email | Role |
 |:------|:-----|
-| `admin@demo.local` | company_admin |
-| `clinic@demo.local` | clinic_admin (clinic 1) |
+| `admin@demo.local` | `company_admin` |
+| `clinic@demo.local` | `clinic_admin`, linked to clinic 1 |
 
-| Screen | Purpose |
-|:-------|:--------|
-| KPIs | Volume, cancel/reschedule, handovers, voice, cost |
-| Clinic setup | Profile + holidays |
-| Departments / Doctors | Specialty & doctor CRUD |
-| Working hours | Weekly hours, leave, slot generation |
-| Doctor schedule | Free / booked / held / blocked |
-| Appointments | List + status + history |
-| Conversations | Transcripts + handovers |
-| Reminders | Due send / dry-run / retry |
-| Settings | Reminder / escalation knobs |
-| Usage | Provider / operation spend |
-| Users | Create/manage admins (`company_admin` only) |
-| Clinics | Create clinics (`company_admin` only) |
+### 18.2 Roles and clinic scope
+
+| Role | Clinics it can open | Extra screens |
+|:-----|:--------------------|:--------------|
+| `company_admin` | Every clinic under its `tenant_id` | Users, Clinics, Usage / costs |
+| `clinic_admin` | Only clinics linked in `admin_user_clinics` | — |
+
+`list_clinics_for_user()` builds the sidebar clinic list from the role, and `user_can_access_clinic()` re-checks the selected clinic **before any page renders** — so a stale session or a hand-edited selection cannot cross a tenant boundary. `_normalize_role()` folds legacy values (`admin`, `company`, `super_admin` → `company_admin`; `clinic`, `staff` → `clinic_admin`).
+
+### 18.3 Screens
+
+| Screen | Purpose | Who sees it |
+|:-------|:--------|:------------|
+| KPIs | Volume, conversion, cancellations, no-shows, voice counts, handovers | Everyone (spend metrics: company admin) |
+| Clinic setup | Profile + holidays | Everyone |
+| Departments / Doctors | Specialty & doctor CRUD | Everyone |
+| Working hours | Weekly hours, leave, slot generation | Everyone |
+| Doctor schedule | Free / booked / held / blocked | Everyone |
+| Appointments | List + status + history | Everyone |
+| Conversations | Transcripts + handovers | Everyone |
+| Reminders | Due send / dry-run / retry failed | Everyone |
+| Settings | Reminder / escalation knobs per clinic | Everyone |
+| Usage / costs | Provider + operation spend, message counts, recent calls | **`company_admin`** |
+| Users | Create admins, set role, assign clinics | **`company_admin`** |
+| Clinics | Create clinics under the tenant | **`company_admin`** |
+
+Restricted screens are removed from the sidebar **and** guarded at the routing branch, so they cannot be reached by rerunning with a stale page key.
+
+### 18.4 What the KPIs mean
+
+`compute_kpis(db, clinic_id=…, days=30)` — most metrics count rows created inside the window:
+
+| KPI | Definition |
+|:----|:-----------|
+| Conversations | `conversations` created in the period |
+| Booking attempts | `max(booking conversations, appointments created)` — see §24.5 |
+| Confirmed | Appointments with status `confirmed` or `rescheduled` |
+| **Conversion** | `min(confirmed ÷ booking_attempts, 1.0)` |
+| Cancelled | Status `cancelled`, by `updated_at` |
+| Rescheduled | `appointment_histories` rows whose reason mentions reschedule |
+| No-shows | Status `no_show` (**all time**, not windowed) |
+| Failed intents | Conversations with intent `unknown` / `failed` / `fallback` |
+| Voice notes / minutes | `voice_messages` count and `duration_sec ÷ 60` |
+| Reminders | Count per `ReminderStatus` |
+| Handovers | Open / closed `handover_cases` (not windowed) |
+| Spend | `estimated_cost`, `voice_estimated_cost`, `voice_cost_avg` — company admin only |
+
+Two honest caveats: no-shows and handovers ignore the period slider, and `compute_kpis()` still *computes* spend for every caller — the dashboard is what withholds it (§24.4).
+
+### 18.5 Running it
+
+| Environment | How |
+|:------------|:----|
+| Local | `streamlit run dashboard/streamlit_app.py --server.port 8501` |
+| Production | Windows service `HospitalChatbotDashboard` on `0.0.0.0:8501`, restarted by the deploy (§21.2) |
 
 Production URL: `http://196.219.86.38:8501/`
 
@@ -1422,10 +1368,13 @@ Production URL: `http://196.219.86.38:8501/`
 | `WHATSAPP_TOKEN` / `PHONE_NUMBER_ID` | — | Cloud API send |
 | `WHATSAPP_API_VERSION` | `v19.0` | Graph API version |
 | `USE_DOCTOR_FLOW` / `WHATSAPP_FLOW_ID` | `false` / `""` | Optional doctor Flow |
+| `WHATSAPP_FLOW_DRAFT` | `false` | Test an unpublished Draft Flow; the engine also retries in draft mode when Meta rejects the id |
 | `OPENAI_API_KEY` | — | LLM + Whisper |
+| `GROQ_API_KEY` | — | Read into config but **unused** — the voice path never calls Groq |
 | `OPENAI_MODEL` | `gpt-4o-mini` | Default LLM |
 | `OPENAI_STT_MODEL` | `whisper-1` | Speech-to-text |
 | `OPENAI_VOICE_STRUCTURE_MODEL` | same as model | Voice planner model |
+| `VOICE_STT_PROMPT` | `false` | Bias Whisper with doctor/specialty vocab. Left **off**: it caused hallucinated names in live Egyptian notes |
 | `VOICE_ROUTER_V2` | `true` | LLM plan + executor |
 | `VOICE_REQUIRE_CONFIRM` | `false` | Extra voice confirm gate |
 | `VOICE_SKIP_CONFIRM_THRESHOLD` | `0.55` | Confidence skip |
@@ -1437,11 +1386,14 @@ Production URL: `http://196.219.86.38:8501/`
 | `DUPLICATE_APPOINTMENT_DAYS` | `7` | Duplicate guard |
 | `ALLOW_OVERBOOKING` | `false` | Overbook policy |
 | `REQUIRE_DOB` | `false` | Ask DOB |
-| `REMINDER_HOURS_BEFORE` | `24,2` | Reminder offsets |
+| `REMINDER_HOURS_BEFORE` | `24,2` | Reminder offsets — each entry is a paid template once §14 ships |
 | `CLINIC_DISPLAY_NAME` / locations / maps | clinic defaults | Patient-facing copy |
 | `RECEPTIONIST_WHATSAPP` | `""` | Handover notify |
 | `LOG_LEVEL` | `INFO` | (`main.py`) |
 | `ADMIN_DASHBOARD_PASSWORD` | `admin123` | Bootstrap / seed only — sets initial `admin_users.password_hash` |
+| `ADMIN_BOOTSTRAP_PASSWORD` | falls back to the above | Same purpose, preferred name in the migration |
+| `VOICE_PRICE_STT_PER_MIN` / `VOICE_PRICE_*_PER_1M` | code table | Override provider rates without a deploy ([`COST.md`](COST.md) §1.2) |
+| `VOICE_STT_FALLBACK_BITRATE_KBPS` | `16` | Duration estimate when the OGG granule cannot be read |
 
 ```python
 # app/core/config.py (pattern)
@@ -1572,9 +1524,11 @@ Deep dive: [`DEPLOYMENT.md`](DEPLOYMENT.md).
 | Env | API | Dashboard |
 |:----|:----|:----------|
 | Local | `http://127.0.0.1:8000` | `http://localhost:8501` |
-| Production | Windows service on `196.219.86.38` | `http://196.219.86.38:8501/` |
+| Production | `HospitalChatbotBackend` on `196.219.86.38:8000` | `HospitalChatbotDashboard` → `http://196.219.86.38:8501/` |
 
 Server path: `C:\apps\hospital-chatbot`
+
+Both processes are **Windows services** now. The dashboard one (`HospitalChatbotDashboard`) is installed once with `scripts/install_streamlit_service.ps1`, which wraps Streamlit in NSSM so it survives a closed PowerShell window and a reboot, and writes rotating logs to `logs\streamlit_*.log`. Capacity limits of this single host: §25.1–25.3.
 
 ### 21.2 CI/CD
 
@@ -1582,12 +1536,12 @@ Server path: `C:\apps\hospital-chatbot`
 
 **Figure 8 — A merge is a promise to the live clinic**
 
-Push to `main` is not a ceremony. GitHub Actions SSH into Windows, pull, pip, migrate, restart the backend. The people already chatting should meet the code we just trusted.
+Push to `main` is not a ceremony. GitHub Actions SSH into Windows, pull, pip, migrate, restart **both** services. The people already chatting should meet the code we just trusted.
 
 | | |
 |:--|:--|
 | **The problem it solves** | “It works on my laptop” while the clinic number still runs last week’s bot. |
-| **What to notice** | Streamlit files land, but the dashboard process is **restarted by hand**. Secrets stay in Actions, not in git. |
+| **What to notice** | Since Phase 2 the dashboard restarts itself too — the step is skipped silently if `HospitalChatbotDashboard` is not installed. Secrets stay in Actions, not in git. |
 
 | Piece | Detail |
 |:------|:-------|
@@ -1598,11 +1552,13 @@ Push to `main` is not a ceremony. GitHub Actions SSH into Windows, pull, pip, mi
 
 | Change type | Auto on deploy? |
 |:------------|:----------------|
-| Backend `app/` | Yes (service restart) |
-| Migrations | Yes |
-| `requirements.txt` | Yes |
-| Streamlit `dashboard/` | Files only — **restart manually** |
-| Server `.env` | No |
+| Backend `app/` | Yes — `Restart-Service HospitalChatbotBackend -Force` |
+| Migrations | Yes — `python -m alembic upgrade head` |
+| `requirements.txt` | Yes — `pip install -r requirements.txt` |
+| Streamlit `dashboard/` | Yes — `Restart-Service HospitalChatbotDashboard` when the service exists |
+| Server `.env` | No — edit on the server; never commit secrets |
+
+Deploy order on the host: `git fetch` → `checkout main` → `pull` → `pip install` → `alembic upgrade head` → restart backend → restart dashboard.
 
 ### 21.3 Logging
 
@@ -1610,8 +1566,9 @@ Push to `main` is not a ceremony. GitHub Actions SSH into Windows, pull, pip, mi
 |:-------|:------|
 | App logger | `LOG_LEVEL` in `main.py` |
 | Production stdout | `C:\apps\hospital-chatbot\logs\stdout.log` |
-| Voice cost | `[voice][cost]` lines |
-| Usage | `usage_logs` + dashboard |
+| Dashboard service | `C:\apps\hospital-chatbot\logs\streamlit_*.log` (NSSM, rotating) |
+| Voice spend + latency | `[voice][cost]` lines ([`COST.md`](COST.md) §7) |
+| Usage | `usage_logs` + dashboard Usage screen (company admin) |
 
 ### 21.4 Local commands
 
@@ -1623,6 +1580,7 @@ copy .env.example .env
 .\venv\Scripts\streamlit.exe run dashboard/streamlit_app.py --server.port 8501
 cloudflared tunnel --url http://127.0.0.1:8000
 python -m app.scripts.run_reminders --dry-run --force
+python -m app.scripts.seed_demo
 ```
 
 ### 21.5 Server fallback
@@ -1634,7 +1592,15 @@ git pull origin main
 .\venv\Scripts\pip.exe install -r requirements.txt
 .\venv\Scripts\python.exe -m alembic upgrade head
 Restart-Service HospitalChatbotBackend
+Restart-Service HospitalChatbotDashboard
 Get-Content "C:\apps\hospital-chatbot\logs\stdout.log" -Tail 40 -Encoding UTF8
+```
+
+One-time dashboard service install (elevated PowerShell, needs `nssm.exe`):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_streamlit_service.ps1
+Get-Service HospitalChatbotDashboard
 ```
 
 ### 21.6 WhatsApp Flow setup (optional)
@@ -1651,13 +1617,20 @@ Paste `app/flows/doctor_picker.json` into Meta Flows → publish → set ID → 
 
 ### Ops screenshots
 
-![G32 — GitHub Actions deploy](images/gui/ops-gha-deploy-fail.png)
+![G33 — GitHub Actions deploy succeeded](images/gui/ops-gha-deploy-success.png)
 
-**Figure G32 — When the promise fails, we look here first.** An Actions run of `deploy.yml`. Failure annotations are how we keep the clinic on the air.
+**Figure G33 — A green deploy is the whole ceremony.**
 
-![G33 — Server logs / SSH](images/gui/ops-server-ssh-logs.png)
+Run #18 of **Deploy to Windows server**, triggered manually (`workflow_dispatch`) on `main` at commit `57f505c`. One `deploy` job, **7 s** of work, **11 s** total, status **Success** — SSH in, pull, install, migrate, restart the services.
 
-**Figure G33 — The machine that answers the clinic number.** Production path `C:\apps\hospital-chatbot`, webhook logs, SSH. This is Act III in the real world.
+| | |
+|:--|:--|
+| **What to notice** | Eleven seconds is the honest cost of shipping here, because the heavy lifting is a `git pull` and two service restarts — not a container build. `Re-run all jobs` is the recovery path when the server was unreachable. |
+| **When it is red** | Read the `deploy` job log first: SSH key or host, then `pip install`, then `alembic upgrade head`. The manual fallback is §21.5. |
+
+![G34 — Server logs / SSH](images/gui/ops-server-ssh-logs.png)
+
+**Figure G34 — The machine that answers the clinic number.** Production path `C:\apps\hospital-chatbot`, webhook logs, SSH. This is Act III in the real world.
 
 ---
 
@@ -1673,12 +1646,14 @@ Paste `app/flows/doctor_picker.json` into Meta Flows → publish → set ID → 
 | Date/time hints | `test_voice_date_time_hints.py` |
 | Change target / day | `test_voice_change_target.py` |
 | Reply language | `test_voice_reply_language.py` |
-| Cost | `test_voice_cost.py` |
+| Voice pricing | `test_voice_cost.py` |
 | Choice schedule guard | `test_choice_schedule_guard.py` |
 | Specialty matching | `test_specialty_word_match.py` |
 | Back typos / language phrases | `test_back_typos.py`, `test_language_explicit_phrases.py` |
 
 Manual product scenarios (booking, AR/EN, conflicts, handover, reminders) are exercised live via WhatsApp/API. Deploy workflow currently deploys; it is not a full test gate.
+
+**Known coverage gap.** Phase 2 shipped without automated tests: nothing covers `authenticate_admin()`, role normalization, clinic-scope enforcement, the cost gating, or the conversion formula. Those are exactly the paths where a regression is silent and expensive — a clinic admin seeing another clinic's data would not fail any current test. First tests to write are listed in §24.8.
 
 Eval helpers (research): `eval_voice_*.py` at repo root.
 
@@ -2315,9 +2290,242 @@ The same contract in Arabic. Direct. One missing fact per turn. Emergencies go t
 
 ---
 
-## 24. Version Control & Timeline
+## 24. Phase 2 — what changed recently
 
-### 24.1 Repository
+Phase 1 answered the patient. Phase 2 answers the **organisation**: who is allowed to open this dashboard, which clinics they may see, which numbers they may read, and whether the dashboard is still running tomorrow morning. Three commits on **2026-08-15** carry it.
+
+### 24.1 The shape of Phase 2
+
+| Commit | Change | Sections |
+|:-------|:-------|:---------|
+| `c7da316` | Streamlit multi-clinic auth with company + clinic admin roles, bcrypt hashes, Users/Clinics screens, demo accounts | §18.1–18.3, §24.2–24.3 |
+| `2bf3bcf` | Dashboard runs as the Windows service `HospitalChatbotDashboard` (NSSM) and restarts on deploy | §21.1–21.2, §24.6 |
+| `f9bfcbd` | Conversion KPI fixed to confirmed ÷ attempts (capped), spend screens restricted to company admins | §18.4, §24.4–24.5 |
+
+| | |
+|:--|:--|
+| **The problem it solves** | One shared password for one clinic. Every viewer seeing supplier costs. A conversion rate that could read 300 %. A dashboard that died when someone closed a PowerShell window. |
+| **What to notice** | Nothing about the patient conversation changed in Phase 2. The bot behaves the same; the **operator** side grew up. |
+
+### 24.2 Real accounts, real roles
+
+Before: a single `ADMIN_DASHBOARD_PASSWORD` that anyone with the URL could type, with no identity behind it.
+
+After: each admin is a row in `admin_users` with an email, a role, and a **bcrypt** `password_hash` (`app/core/security.py`). `authenticate_admin()` verifies the hash and refuses anything else — no shared secret, no "any email works" path. The env password survives only to seed the first hash.
+
+```python
+# app/models/admin_models.py
+ROLE_COMPANY_ADMIN = "company_admin"
+ROLE_CLINIC_ADMIN = "clinic_admin"
+ADMIN_ROLES = frozenset({ROLE_COMPANY_ADMIN, ROLE_CLINIC_ADMIN})
+```
+
+Legacy rows are not left stranded: the migration renames `admin` → `company_admin`, and `_normalize_role()` keeps accepting old spellings at runtime.
+
+### 24.3 Many clinics, one dashboard
+
+A company admin belongs to a **tenant** and may open every clinic under it. A clinic admin may open only the clinics explicitly linked in the new `admin_user_clinics` table. The sidebar selector is built from that answer, then re-verified:
+
+```python
+clinics = admin.list_clinics_for_user(db, user)          # role decides the list
+...
+if not admin.user_can_access_clinic(db, user, clinic_id):  # checked before every page
+    st.error(_ui("no_access"))
+```
+
+Two new company-admin screens make this operable without SQL.
+
+![G31 — Users](images/gui/dash-users.png)
+
+**Figure G31 — Accounts are rows now, not a shared secret.**
+
+The table lists `user_id`, email, role, `tenant_id`, `active_flag`, and the assigned `clinic_ids` — here `admin@demo.local` as `company_admin` with no clinic list (it needs none) and `clinic@demo.local` as `clinic_admin` scoped to clinic 1. Below it, **Create user** takes an email, a password, a role, and the clinics to attach.
+
+| | |
+|:--|:--|
+| **What to notice** | With **Company admin (all clinics)** selected, the *Assigned clinics* multiselect is greyed out — the form refuses to ask a meaningless question. The password field writes a bcrypt hash, never plain text. |
+
+![G32 — Clinics](images/gui/dash-clinics.png)
+
+**Figure G32 — A tenant can hold many clinics.** `clinic_id`, `tenant_id`, name, WhatsApp number, timezone, default language, address, status — plus a **Create clinic** form defaulting to `Africa/Cairo` and `ar-EG`. One clinic exists today; the model no longer assumes that.
+
+One boundary worth stating plainly: **the dashboard is multi-clinic; the WhatsApp bot is not yet.** The webhook and conversation engine still resolve `DEFAULT_TENANT_ID` / `DEFAULT_CLINIC_ID` from `.env`, so one running backend still serves one clinic number. Phase 2 prepared the data model and the staff side for multi-clinic; routing inbound messages per clinic remains open work.
+
+### 24.4 Who may see money
+
+Supplier spend is a company concern, not something to show a clinic receptionist. Gating happens in two places, deliberately:
+
+```python
+company = _is_company_admin(user)
+screen_keys = [k for k, _ in SCREENS]
+if not company:
+    screen_keys = [k for k in screen_keys if k not in {"users", "clinics", "usage"}]
+```
+
+and again at the routing branch (`elif page_key == "usage" and company:`), so a stale page key cannot slip through. On the KPIs screen, `page_kpis(..., show_costs=company)` hides `estimated_cost`, `voice_cost`, and `voice_cost_avg`.
+
+| Reader | Sees volume | Sees spend |
+|:-------|:------------|:-----------|
+| `company_admin` | Yes | Yes |
+| `clinic_admin` | Yes | No |
+
+Honest limitation: `compute_kpis()` still computes the cost fields for everyone — the UI is what withholds them. If cost must never reach a clinic admin's browser at all, filter it in the service layer. Full cost picture: [`COST.md`](COST.md) §7.
+
+### 24.5 Conversion that cannot exceed 100%
+
+The old conversion rate divided confirmed appointments by *conversations that looked like booking attempts*. A patient who booked twice in one conversation, or booked through a path the intent filter missed, could push the number above 100 % — which destroys trust in every other KPI on the screen.
+
+Now the denominator counts concrete attempts too, and the result is capped:
+
+```python
+appointment_attempts = <appointments created in the period, any status>
+booking_attempts = max(booking_conversations, appointment_attempts)
+conversion = min(confirmed / booking_attempts, 1.0) if booking_attempts else 0.0
+```
+
+`confirmed` counts statuses `confirmed` **and** `rescheduled` — a moved appointment is still a booking the bot won. Comparing appointment rows with appointment rows is what makes the ratio meaningful.
+
+### 24.6 The dashboard survives a closed window
+
+The dashboard used to be a Streamlit process someone started over SSH; closing the window or rebooting the server took the clinic's only management screen offline.
+
+`scripts/install_streamlit_service.ps1` now registers it once as **`HospitalChatbotDashboard`** through NSSM:
+
+```text
+nssm install HospitalChatbotDashboard <streamlit.exe> run dashboard/streamlit_app.py
+  --server.address 0.0.0.0 --server.port 8501 --browser.gatherUsageStats false
+AppDirectory  : C:\apps\hospital-chatbot
+Start         : SERVICE_AUTO_START
+stdout/stderr : logs\streamlit_*.log (rotating)
+```
+
+The deploy workflow then restarts it alongside the backend, skipping the step when the service is absent — so a server that has not been prepared still deploys instead of failing.
+
+### 24.7 Schema and configuration changes
+
+| Change | Detail |
+|:-------|:-------|
+| Migration | `a1b2c3d4e5f6_admin_auth_clinics.py` — new head |
+| New column | `admin_users.password_hash` (`String(255)`) |
+| New table | `admin_user_clinics` (`user_id`, `clinic_id`) |
+| Data fix | Backfills hashes from the bootstrap password; renames role `admin` → `company_admin` |
+| New dependency | `bcrypt>=4.0.0` |
+| New env | `ADMIN_BOOTSTRAP_PASSWORD` (alias of `ADMIN_DASHBOARD_PASSWORD`, bootstrap only) |
+| New seed | `admin@demo.local` (company) and `clinic@demo.local` (clinic 1) via `seed_demo.py` |
+| New i18n | Login, role, user, and clinic strings in `dashboard/ui_i18n.py` |
+
+Upgrade order on an existing server: `alembic upgrade head` → restart both services → log in with a seeded account → **change that password** → create the real admins from the Users screen.
+
+### 24.8 Known gaps after Phase 2
+
+| Gap | Why it matters | Where it is discussed |
+|:----|:---------------|:----------------------|
+| No tests for auth, roles, scoping, gating, conversion | A silent regression could leak another clinic's data | §22 |
+| Cost still computed for clinic admins | Defence is UI-only | §24.4 |
+| Bot path is single-clinic | Dashboard promises multi-clinic; the webhook does not deliver it yet | §24.3 |
+| Reminders cannot leave the 24-hour window | The most valuable outbound message is undeliverable outside it | §14, §25.4 |
+| Voice latency unmeasured end to end | Only STT and planner times are recorded | §15.5, §25.5 |
+| Drafts still in process memory | Blocks multiple workers | §6.3, §25.2 |
+
+Suggested next tests, in order: `authenticate_admin` accepts the right password and rejects a wrong one; a `clinic_admin` cannot read a clinic outside `admin_user_clinics`; `compute_kpis` conversion never exceeds 1.0; the sidebar for a `clinic_admin` excludes `usage`, `users`, and `clinics`.
+
+---
+
+## 25. Limitations & how to make voice faster
+
+Every promise in this guide runs on one Windows box, one API process, and two remote model calls. This chapter is the honest list of what that costs us, and what we would change first.
+
+### 25.1 What we actually run
+
+| Piece | Detail |
+|:------|:-------|
+| Host | Windows server, production `196.219.86.38`, path `C:\apps\hospital-chatbot` |
+| Backend service | `HospitalChatbotBackend` (FastAPI / Uvicorn, port `8000`) |
+| Dashboard service | `HospitalChatbotDashboard` (Streamlit, `0.0.0.0:8501`, installed via NSSM) |
+| Database | PostgreSQL, pool `size=10`, `max_overflow=20`, `pool_pre_ping=True` |
+| Deploy | GitHub Actions over SSH: pull → pip → `alembic upgrade head` → restart both services (§21) |
+| Logs | `C:\apps\hospital-chatbot\logs\` (`stdout.log`, `streamlit_*.log`) |
+
+**Hardware is not recorded anywhere in this repository** — no CPU count, no RAM, no disk type, no measured network latency. This guide refuses to invent them. Measure the host before promising capacity to a clinic.
+
+### 25.2 The real limits
+
+| Limit | Why it exists | What it costs you |
+|:------|:--------------|:------------------|
+| Single Uvicorn worker (default) | `uvicorn app.main:app` starts one process unless the service command says otherwise | A ceiling on concurrent requests |
+| Synchronous voice pipeline | `requests` plus blocking OpenAI calls inside `BackgroundTasks` | Each in-flight voice note holds a thread for 6–18 s |
+| `BackgroundTasks` is not a queue | The work lives inside the API process | A restart or crash **loses queued voice notes** — no retry, no dead-letter |
+| Drafts in `_SESSION[phone]` memory | An in-process dict, not shared storage | Cannot add workers safely; a restart drops half-finished bookings |
+| Remote inference | Whisper and GPT run at OpenAI | A faster CPU here does **not** shorten the 15-second voice path (§15.5) |
+| One host for everything | API, dashboard, and database access share the machine | A heavy dashboard query competes with patient replies; single point of failure |
+| Temp file per transcription | `NamedTemporaryFile(suffix=".ogg")` per note | Extra disk I/O, free space, and cleanup to worry about |
+| No autoscaling | Fixed Windows services | A campaign or a Ramadan evening queues instead of scaling |
+| Reminder worker is manual | `python -m app.scripts.run_reminders` or a dashboard button | A missed run is a missed reminder unless it is scheduled |
+| Bot path is single-clinic | The webhook resolves `DEFAULT_CLINIC_ID` from `.env` | One backend serves one clinic number, even though the dashboard is multi-clinic (§24.3) |
+
+### 25.3 Capacity, honestly framed
+
+A voice note occupies a worker thread for roughly 6–18 seconds of mostly *waiting on the network*. With `T` usable threads and `S` seconds per note:
+
+```text
+sustainable voice notes per minute ≈ 60 × T / S
+```
+
+At `S = 12 s` that is 4 notes per minute per thread. Measured reality is **115 voice notes in 30 days** — about 0.003 notes per minute, three orders of magnitude below the ceiling.
+
+| | |
+|:--|:--|
+| **What this means** | Today's problem is **latency per note, not volume.** The limits in §25.2 bite during a campaign, not on an average Tuesday. |
+| **What would change it** | A marketing push, a second clinic on the same backend, or a reminder blast that invites hundreds of replies inside one hour. |
+
+### 25.4 The 24-hour WhatsApp wall
+
+The hardest limit is not ours — it is Meta's. Every inbound patient message opens a **24-hour customer-service window**. Inside it, everything we send is free-form and free. Outside it, Meta refuses free-form content entirely and accepts only a pre-approved, **paid** template.
+
+| Message | Inside the window? | Consequence |
+|:--------|:-------------------|:------------|
+| Any reply to a patient message | Yes | Free-form, free |
+| Booking confirmation right after booking | Yes | Free-form, free |
+| `2h_before` reminder | Only if the patient wrote that same day | Usually needs a paid template |
+| `24h_before` reminder | Almost never — the booking is typically days earlier | Needs a paid template |
+
+Reminders are scheduled from the appointment, not from the conversation (`scheduled_at = slot_start - REMINDER_HOURS_BEFORE`), so a visit booked today for next Tuesday has its reminders due long after the window shut. `process_due_reminders()` calls `wa.send_buttons()` — free-form — so Meta rejects the send, the row lands on `status=failed`, and `retry_count` climbs. **The failure is structural, not transient: retrying cannot fix it** (§14, Figure G29).
+
+Making reminders real is four pieces of work, none of them large:
+
+1. **Get a template approved** — `appointment_reminder`, *utility* category, Arabic and English, with variables for reference, doctor, date, time, and location.
+2. **Add `send_template()`** to `app/services/whatsapp_client.py` and call it from `process_due_reminders()` whenever the window is shut or the type ends in `_before`.
+3. **Fund the WhatsApp Business Account** — template sends draw on a Meta balance; unfunded means silently stopped.
+4. **Log and budget it** — a `whatsapp_template` operation in `usage_logs`, and a line item of `confirmed_appointments × len(REMINDER_HOURS_BEFORE)` paid messages per month. Per-message rates are in [`COST.md`](COST.md).
+
+One consolation worth knowing: when a patient taps *Reschedule* on a template reminder, they reopen the window, and the entire conversation that follows is free again.
+
+### 25.5 Making a voice reply faster
+
+The 15 seconds are a **sum of remote waits**, not a slow server (§15.5 has the stage-by-stage budget). So the fixes are about overlapping, acknowledging, and measuring — not about hardware.
+
+| # | Fix | Effort | Recurring cost | What it buys |
+|--:|:----|:-------|:---------------|:-------------|
+| 1 | Full stage timing (`meta_download_ms`, `queue_wait_ms`, `executor_ms`, `total_ms`) with p50/p95 | Small | None | Evidence instead of an argument about the 15 seconds |
+| 2 | Instant “voice received, one moment” acknowledgement | Small | None (in-window, free) | The biggest perceived-speed win available; the wait stops feeling like silence |
+| 3 | Reused OpenAI client and pooled HTTP session | Small | None | Fewer TLS handshakes per note |
+| 4 | Trim the dynamic context (`OPTIONS_JSON`, state) to the current step | Small | Saves money too | Fewer planner tokens, faster planning |
+| 5 | Cap or reject unusually long notes | Small | Saves money too | Bounded STT time; the 3.89 s average note is already fine |
+| 6 | A/B a cheaper or faster transcription model | Small–medium | Usually saves money | Possibly seconds off STT — but only if Egyptian-dialect accuracy holds ([`COST.md`](COST.md) §2 prices every option) |
+| 7 | Drafts in Redis or PostgreSQL | Medium | A small Redis instance | The precondition for more than one worker |
+| 8 | Durable voice queue with dedicated workers | Medium–large | Redis plus a worker process | Real concurrency, no lost notes on restart |
+| 9 | Second host and managed PostgreSQL | Medium | Second server, managed DB | Removes the single point of failure |
+| 10 | Monitoring and alerting | Small–medium | Tool subscription | Knowing before the clinic phones us |
+
+Order matters: **1 and 2 first.** Measurement turns the complaint into a number, and the acknowledgement makes the remaining seconds tolerable while the deeper work waits for evidence.
+
+Explicitly **not** recommended: running Whisper locally on this box "to be faster and cheaper." That trades a fraction-of-a-cent bill for hardware, and on an unmeasured CPU-only Windows server it will most likely be slower *and* worse on Egyptian dialect. Revisit only with a GPU host and a measured accuracy test against `whisper-1`.
+
+---
+
+## 26. Version Control & Timeline
+
+### 26.1 Repository
 
 | Item | Value |
 |:-----|:------|
@@ -2352,7 +2560,7 @@ git push -u origin <branch-name>
 |:-------|:-----------|
 | `app/`, `dashboard/`, `alembic/`, `tests/`, `docs/`, workflows | `.env` secrets, production DB data, `venv/`, private SSH keys |
 
-### 24.2 Project timeline (from git history)
+### 26.2 Project timeline (from git history)
 
 | Date | Milestone |
 |:-----|:----------|
@@ -2370,6 +2578,12 @@ git push -u origin <branch-name>
 | 2026-08-03 | Booking flow improvements (PR #10) |
 | 2026-08-04 | Deploy hardening + voice date/language fixes |
 | 2026-08-05 | Architecture documentation refresh (this guide) |
+| 2026-08-15 | **Phase 2:** multi-clinic dashboard auth with company/clinic roles (`c7da316`) |
+| 2026-08-15 | **Phase 2:** dashboard as a Windows service, restarted on deploy (`2bf3bcf`) |
+| 2026-08-15 | **Phase 2:** conversion KPI fix + spend restricted to company admins (`f9bfcbd`) |
+| 2026-08-16 | Cost, billing, and server-limit guide split into [`COST.md`](COST.md) |
+| 2026-08-16 | Screenshot gallery recaptured on the Phase 2 dashboard; successful deploy run #18 (`57f505c`) documented |
+| 2026-08-16 | Limitations and voice-latency plan consolidated into §25; `COST.md` reduced to a model price comparison |
 
 ```mermaid
 timeline
@@ -2381,11 +2595,12 @@ timeline
   section August
     01–03 : Docs + flow polish
     04–05 : Deploy harden + architecture guide
+    15–16 : Phase 2 dashboard + cost guide
 ```
 
 ---
 
-## 25. Document History
+## 27. Document History
 
 | Date | Version | Change |
 |:-----|:--------|:-------|
@@ -2397,9 +2612,12 @@ timeline
 | 2026-08-06 | 3.3 | Live GUI screenshot gallery under `docs/images/gui/` |
 | 2026-08-06 | 4.0 | Restructured: product → architecture → ops → reference |
 | **2026-08-13** | **4.1** | **Story index (Acts I–IV); every flow figure has its own description; system prompts explained (summary, what it does, components, rules, Start/End of prompt)** |
-| **2026-08-15** | **4.2** | **Voice cost, $1 capacity, 15-second latency analysis, server limits, optimization plan, and JSON prompt/output contract** |
+| 2026-08-15 | 4.2 | Voice cost, $1 capacity, 15-second latency analysis, server limits, optimization plan, and JSON prompt/output contract |
+| 2026-08-16 | 5.0 | Phase 2 chapter (§24: roles, multi-clinic scope, cost gating, conversion fix, dashboard service); dashboard, schema, config, and deploy sections refreshed; all pricing and capacity content moved to [`COST.md`](COST.md) |
+| 2026-08-16 | 5.1 | Dashboard gallery recaptured on the Phase 2 UI (G20–G30) with Users and Clinics added at §24.3 (G31–G32); failed-deploy figure replaced with the successful run #18 (G33); figure inventory renumbered |
+| **2026-08-16** | **5.2** | **New §25 “Limitations & how to make voice faster”: what we run, the real limits, capacity math, the 24-hour WhatsApp wall, and a ranked latency plan — all moved back from `COST.md`, which is now a price comparison only. Timeline, history, and appendix renumbered to §26–§28** |
 
-## 26. Appendix
+## 28. Appendix
 
 ### A — Key public functions
 
@@ -2411,18 +2629,27 @@ timeline
 | Booking svc | `hold_slot`, `confirm_booking`, `reschedule_appointment`, `cancel_appointment`, `release_expired_holds` |
 | Voice | `route_whatsapp_voice_message`, `execute_plan`, `try_voice_smart_route` |
 | Reminders | `create_booking_reminders`, `process_due_reminders` |
-| Dashboard | `authenticate_admin`, `compute_kpis`, CRUD in `admin_dashboard_service` |
+| Dashboard | `authenticate_admin`, `list_clinics_for_user`, `user_can_access_clinic`, `compute_kpis`, CRUD in `admin_dashboard_service` |
+| Security | `hash_password`, `verify_password` (`app/core/security.py`) |
 
 ### B — Tools (runtime vs dev)
 
 | Runtime | Dev / ops |
 |:--------|:----------|
-| FastAPI, Uvicorn, PostgreSQL, SQLAlchemy, Alembic, LangGraph, Meta Cloud API, OpenAI, Streamlit, Pillow, lingua | Git/GitHub, Actions, pytest, Swagger `/docs`, PowerShell, cloudflared |
+| FastAPI, Uvicorn, PostgreSQL, SQLAlchemy, Alembic, LangGraph, Meta Cloud API, OpenAI, Streamlit, bcrypt, Pillow, lingua | Git/GitHub, Actions, pytest, Swagger `/docs`, PowerShell, NSSM, cloudflared |
 
 Cursor / research chatbots are **not** part of the runtime stack.
+
+### C — Companion documents
+
+| Document | Answers |
+|:---------|:--------|
+| [`COST.md`](COST.md) | What a message, a voice note, and a reminder cost; what $1 buys; WhatsApp's 24-hour template rule; what this server can carry |
+| [`DEPLOYMENT.md`](DEPLOYMENT.md) | SSH keys, secrets, service install, rollback |
+| [`README.md`](../README.md) | Local setup and quick start |
 
 ---
 
 The story ends where it began: a person who needed a doctor, a chair that must not be given twice, and a clinic that deserves one diary. If this guide helped you keep that promise, it did its job.
 
-*End of guide — Hospital Chatbot Technical & Architecture Documentation v4.2*
+*End of guide — Hospital Chatbot Technical & Architecture Documentation v5.2*
